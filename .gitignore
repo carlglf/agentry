@@ -1,0 +1,16 @@
+.npm-cache/
+
+node_modules/
+
+# Claude Code 本地配置/状态（含本地权限与运行状态，不入库）
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# 讨论组 server 端 JSON 持久化（运行时数据，不入库）
+agent-console/.data/
+
+dist/
+
+# 独立运行包构建产物
+agent-console/release/
+agent-console/release.tar.gz
