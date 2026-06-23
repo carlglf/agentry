@@ -1265,7 +1265,9 @@ const WORKFLOW_ROLE_LABEL: Record<string, string> = {
   doc: "文档",
 };
 
-type RoleBinding = { memberId: string; runtime?: string; model?: string; persona?: string; duty?: string };
+type RoleBinding = { memberId?: string; runtime?: string; model?: string; persona?: string; duty?: string };
+type WorkflowRoleSource = "builtin" | "custom" | "group";
+type CustomWorkflowRole = { runtime: AgentRuntime; model: string; persona: string; duty: string };
 
 type CreateRunPayload = {
   projectId: string;
@@ -1312,6 +1314,9 @@ const WORKFLOW_ACTIVE_STATUSES: WorkflowRunStatus[] = [
   "integrating",
   "needs_attention",
 ];
+
+const EMPTY_WORKFLOW_RUNS: WorkflowRun[] = [];
+const EMPTY_WORKFLOW_ROLE_IDS: string[] = [];
 
 type WorkflowStore = {
   runsByProject: Record<string, WorkflowRun[]>;
@@ -2402,7 +2407,7 @@ function MemberTerminal({ ttyKey, readOnly = false }: { ttyKey: string; readOnly
 // ====== 自动开发编排 UI ======
 
 function WorkflowTree({ project }: { project: Project }) {
-  const runs = useWorkflowStore((state) => state.runsByProject[project.id] || []);
+  const runs = useWorkflowStore((state) => state.runsByProject[project.id] || EMPTY_WORKFLOW_RUNS);
   const selectedRunId = useWorkflowStore((state) => state.selectedRunId);
   const loadRuns = useWorkflowStore((state) => state.loadRuns);
   const selectRun = useWorkflowStore((state) => state.selectRun);
@@ -2463,6 +2468,7 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
   const loadTemplates = useWorkflowStore((state) => state.loadTemplates);
   const createRun = useWorkflowStore((state) => state.createRun);
   const cancelCreate = useWorkflowStore((state) => state.cancelCreate);
+  const runtimeOptions = useRuntimeMetaStore((state) => state.options);
   const allGroups = useDiscussionStore((state) => state.groups);
   const loadGroups = useDiscussionStore((state) => state.loadGroups);
   const groups = useMemo(() => allGroups.filter((g) => g.projectId === projectId), [allGroups, projectId]);
@@ -2476,9 +2482,11 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
   const [enableTesting, setEnableTesting] = useState(true);
   const [enableDoc, setEnableDoc] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [roleSource, setRoleSource] = useState<WorkflowRoleSource>("builtin");
   const [groupId, setGroupId] = useState("");
   // 角色 → 讨论组成员id 的绑定（roleId -> memberId）。
   const [roleMap, setRoleMap] = useState<Record<string, string>>({});
+  const [customRoles, setCustomRoles] = useState<Record<string, CustomWorkflowRole>>({});
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -2499,11 +2507,11 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
   }, [templates, templateId]);
 
   const selectedTemplate = templates.find((t) => t.id === templateId);
-  const selectedGroup = groups.find((g) => g.id === groupId);
+  const selectedGroup = roleSource === "group" ? groups.find((g) => g.id === groupId) : undefined;
 
   // 当前模板涉及的角色（规划 + 各任务阶段 + 集成），去重。
   const roleIds = useMemo(() => {
-    if (!selectedTemplate) return [] as string[];
+    if (!selectedTemplate) return EMPTY_WORKFLOW_ROLE_IDS;
     const ids = [
       selectedTemplate.planningRoleId,
       ...selectedTemplate.taskStages.map((s) => s.roleId),
@@ -2514,8 +2522,8 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
 
   // 选组后按成员 duty/name 与 roleId 做初步自动匹配（可手改）。
   useEffect(() => {
-    if (!selectedGroup || !roleIds.length) {
-      setRoleMap({});
+    if (roleSource !== "group" || !selectedGroup || !roleIds.length) {
+      setRoleMap((prev) => (Object.keys(prev).length ? {} : prev));
       return;
     }
     const members = selectedGroup.members;
@@ -2528,7 +2536,47 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
       next[roleId] = hit ? hit.id : members[0]?.id || "";
     }
     setRoleMap(next);
-  }, [selectedGroup, roleIds]);
+  }, [roleSource, selectedGroup, roleIds]);
+
+  useEffect(() => {
+    if (roleSource !== "custom" || !roleIds.length) {
+      return;
+    }
+    setCustomRoles((prev) => {
+      let changed = false;
+      const next: Record<string, CustomWorkflowRole> = {};
+      for (const roleId of roleIds) {
+        const previous = prev[roleId];
+        const runtime = previous?.runtime || "codex";
+        const model = previous?.model || runtimeOptions[runtime].defaultModel;
+        next[roleId] = {
+          runtime,
+          model,
+          persona: previous?.persona || "",
+          duty: previous?.duty || WORKFLOW_ROLE_LABEL[roleId] || roleId,
+        };
+        if (!previous || previous.runtime !== next[roleId].runtime || previous.model !== next[roleId].model || previous.persona !== next[roleId].persona || previous.duty !== next[roleId].duty) {
+          changed = true;
+        }
+      }
+      if (Object.keys(prev).some((roleId) => !roleIds.includes(roleId))) {
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [roleSource, roleIds, runtimeOptions]);
+
+  function patchCustomRole(roleId: string, patch: Partial<CustomWorkflowRole>) {
+    setCustomRoles((prev) => {
+      const current = prev[roleId] || {
+        runtime: "codex" as AgentRuntime,
+        model: runtimeOptions.codex.defaultModel,
+        persona: "",
+        duty: WORKFLOW_ROLE_LABEL[roleId] || roleId,
+      };
+      return { ...prev, [roleId]: { ...current, ...patch } };
+    });
+  }
 
   async function submit() {
     setError("");
@@ -2544,11 +2592,31 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
       setError("请选择运行方式");
       return;
     }
+    if (roleSource === "group" && !selectedGroup) {
+      setError("请选择要复用的讨论组");
+      return;
+    }
     setBusy(true);
     try {
-      // 由所选讨论组成员组装角色绑定（runtime/model/persona/duty 复用成员名册）。
+      // 由自定义配置或所选讨论组成员组装角色绑定，覆盖模板角色默认 runtime/model/persona/duty。
       let roleBindings: Record<string, RoleBinding> | undefined;
-      if (selectedGroup && roleIds.length) {
+      if (roleSource === "custom" && roleIds.length) {
+        roleBindings = {};
+        for (const roleId of roleIds) {
+          const role = customRoles[roleId] || {
+            runtime: "codex" as AgentRuntime,
+            model: runtimeOptions.codex.defaultModel,
+            persona: "",
+            duty: WORKFLOW_ROLE_LABEL[roleId] || roleId,
+          };
+          roleBindings[roleId] = {
+            runtime: role.runtime,
+            model: role.model,
+            persona: role.persona.trim(),
+            duty: role.duty.trim(),
+          };
+        }
+      } else if (roleSource === "group" && selectedGroup && roleIds.length) {
         roleBindings = {};
         for (const roleId of roleIds) {
           const memberId = roleMap[roleId];
@@ -2571,7 +2639,7 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
         baseBranch: baseBranch.trim(),
         integrationMode,
         workflowTemplateId: templateId,
-        groupId: selectedGroup ? selectedGroup.id : undefined,
+        groupId: roleSource === "group" && selectedGroup ? selectedGroup.id : undefined,
         settings: roleBindings ? { roleBindings } : undefined,
         overrides: { maxReviewRounds, enableTesting, enableDoc, integrationMode },
       });
@@ -2655,18 +2723,36 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
         )}
 
         <div className="wf-field">
-          <span>讨论组（可选，复用成员作为执行角色）</span>
-          <select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
-            <option value="">不复用讨论组（使用内置默认角色）</option>
-            {groups.map((g) => (
-              <option key={g.id} value={g.id}>
-                {g.name}（{g.members.length} 名成员）
-              </option>
-            ))}
+          <span>执行角色</span>
+          <select
+            value={roleSource}
+            onChange={(e) => {
+              const next = e.target.value as WorkflowRoleSource;
+              setRoleSource(next);
+              if (next !== "group") setGroupId("");
+            }}
+          >
+            <option value="builtin">使用内置默认角色</option>
+            <option value="custom">自定义每个角色</option>
+            {groups.length > 0 && <option value="group">复用讨论组成员</option>}
           </select>
         </div>
 
-        {selectedGroup && roleIds.length > 0 && (
+        {roleSource === "group" && (
+          <div className="wf-field">
+            <span>讨论组</span>
+            <select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
+              <option value="">请选择讨论组</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}（{g.members.length} 名成员）
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {roleSource === "group" && selectedGroup && roleIds.length > 0 && (
           <div className="wf-field">
             <span>角色 → 成员映射</span>
             <div className="wf-role-map">
@@ -2686,6 +2772,69 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
                   </select>
                 </label>
               ))}
+            </div>
+          </div>
+        )}
+
+        {roleSource === "custom" && roleIds.length > 0 && (
+          <div className="wf-field">
+            <span>自定义角色</span>
+            <div className="wf-custom-roles">
+              {roleIds.map((roleId) => {
+                const role = customRoles[roleId] || {
+                  runtime: "codex" as AgentRuntime,
+                  model: runtimeOptions.codex.defaultModel,
+                  persona: "",
+                  duty: WORKFLOW_ROLE_LABEL[roleId] || roleId,
+                };
+                return (
+                  <div className="wf-custom-role" key={roleId}>
+                    <div className="wf-custom-role-title">{WORKFLOW_ROLE_LABEL[roleId] || roleId}</div>
+                    <label className="wf-field">
+                      <span>运行时</span>
+                      <select
+                        value={role.runtime}
+                        onChange={(e) => {
+                          const runtime = e.target.value as AgentRuntime;
+                          patchCustomRole(roleId, { runtime, model: runtimeOptions[runtime].defaultModel });
+                        }}
+                      >
+                        {(Object.keys(agentRuntimeOptions) as AgentRuntime[]).map((key) => (
+                          <option key={key} value={key}>
+                            {agentRuntimeOptions[key].label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="wf-field">
+                      <span>模型</span>
+                      <select value={role.model} onChange={(e) => patchCustomRole(roleId, { model: e.target.value })}>
+                        {runtimeOptions[role.runtime].models.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                        {!runtimeOptions[role.runtime].models.some((opt) => opt.value === role.model) && role.model ? (
+                          <option value={role.model}>{role.model}</option>
+                        ) : null}
+                      </select>
+                    </label>
+                    <label className="wf-field wf-custom-role-duty">
+                      <span>职责</span>
+                      <input value={role.duty} onChange={(e) => patchCustomRole(roleId, { duty: e.target.value })} />
+                    </label>
+                    <label className="wf-field wf-custom-role-persona">
+                      <span>人设</span>
+                      <textarea
+                        rows={2}
+                        placeholder="例如：偏保守，先确认风险再执行"
+                        value={role.persona}
+                        onChange={(e) => patchCustomRole(roleId, { persona: e.target.value })}
+                      />
+                    </label>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
