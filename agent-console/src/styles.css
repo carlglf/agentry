@@ -598,6 +598,20 @@ button {
   font-family: var(--mono);
 }
 
+.chat-go-dev {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(120, 200, 140, 0.35);
+}
+
+.chat-go-dev-hint {
+  color: #8fe3a6;
+  font-size: 12px;
+}
+
 table {
   width: 100%;
   margin-top: 10px;
@@ -1811,6 +1825,199 @@ th {
   color: var(--faint);
   margin-top: 6px;
 }
+.wf-source-tag.custom {
+  color: var(--purple, var(--cyan));
+  border-color: var(--purple, var(--cyan));
+}
+.wf-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wf-link-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: var(--cyan);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+.wf-link-action:disabled {
+  color: var(--faint);
+  cursor: not-allowed;
+}
+.wf-template-del {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--faint);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px;
+}
+.wf-template-del:hover {
+  color: var(--red);
+  background: var(--panel);
+}
+.wf-save-tpl {
+  margin-top: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.wf-save-tpl-hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+}
+.wf-save-tpl-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.wf-stage-add {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--cyan);
+  font-size: 12px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.wf-stage-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.wf-stage-fixed {
+  font-size: 12px;
+  color: var(--faint);
+  background: var(--panel);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.wf-stage-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 6px 4px 10px;
+}
+.wf-stage-name {
+  font-size: 13px;
+  color: var(--text);
+}
+.wf-stage-ops {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.wf-stage-ops button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+}
+.wf-stage-ops button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel);
+}
+.wf-stage-ops button:disabled {
+  color: var(--faint);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.wf-template-card-ops {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.wf-editor {
+  margin-top: 10px;
+  background: linear-gradient(180deg, rgba(16, 24, 33, 0.96), rgba(12, 18, 25, 0.96));
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.wf-editor-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 2px;
+}
+.wf-editor-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+.wf-editor > .wf-field-row {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(320px, 1fr);
+  gap: 12px;
+}
+.wf-editor .wf-field input,
+.wf-editor .wf-field select {
+  min-height: 34px;
+}
+.wf-editor .wf-field textarea {
+  min-height: 66px;
+  line-height: 1.45;
+  resize: vertical;
+}
+.wf-editor .wf-field input:focus,
+.wf-editor .wf-field select:focus,
+.wf-editor .wf-field textarea:focus,
+.wf-stage-add:focus {
+  outline: none;
+  border-color: rgba(70, 148, 245, 0.68);
+  box-shadow: 0 0 0 2px rgba(43, 133, 255, 0.13);
+}
+.wf-editor .wf-field-head {
+  min-height: 34px;
+}
+.wf-custom-role-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wf-custom-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wf-custom-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.wf-custom-summary-meta {
+  font-size: 12px;
+  color: var(--faint);
+}
 .wf-role-map,
 .wf-custom-roles {
   display: flex;
@@ -1847,6 +2054,61 @@ th {
 }
 .wf-custom-role-persona {
   grid-column: span 2;
+}
+.wf-editor .wf-custom-roles {
+  gap: 12px;
+}
+.wf-editor .wf-custom-role {
+  border-radius: 8px;
+  background: rgba(8, 13, 19, 0.38);
+  border-color: rgba(124, 145, 166, 0.24);
+}
+.wf-stage-editor-card {
+  display: grid;
+  grid-template-columns: minmax(104px, 132px) minmax(140px, 0.72fr) minmax(190px, 1fr) minmax(170px, 0.82fr) minmax(190px, 1fr);
+  gap: 10px 12px;
+  padding: 12px;
+}
+.wf-stage-editor-card > .wf-custom-role-title {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 8px;
+  padding-top: 6px;
+  min-width: 0;
+}
+.wf-stage-editor-card > .wf-custom-role-title > span:first-child {
+  overflow-wrap: anywhere;
+}
+.wf-stage-editor-card > .wf-field-row,
+.wf-planning-editor-card > .wf-field-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.wf-stage-editor-card > .wf-field-row {
+  display: contents;
+}
+.wf-stage-editor-card > .wf-field-row > .wf-field,
+.wf-stage-editor-card > .wf-field {
+  min-width: 0;
+}
+.wf-stage-editor-card > .wf-field:nth-of-type(1) {
+  grid-column: 2 / span 2;
+}
+.wf-stage-editor-card > .wf-field:nth-of-type(2) {
+  grid-column: 4 / span 2;
+}
+.wf-planning-editor-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+.wf-planning-editor-card > .wf-field {
+  min-width: 0;
 }
 .wf-advanced-toggle {
   background: none;
@@ -1914,6 +2176,21 @@ th {
   .wf-field-row-item,
   .wf-custom-role {
     grid-template-columns: 1fr;
+  }
+  .wf-editor > .wf-field-row,
+  .wf-stage-editor-card,
+  .wf-stage-editor-card > .wf-field-row,
+  .wf-planning-editor-card > .wf-field-row {
+    grid-template-columns: 1fr;
+  }
+  .wf-stage-editor-card > .wf-field-row {
+    display: grid;
+  }
+  .wf-stage-editor-card > .wf-custom-role-title,
+  .wf-stage-editor-card > .wf-field-row,
+  .wf-stage-editor-card > .wf-field {
+    grid-column: auto;
+    grid-row: auto;
   }
   .wf-custom-role-title {
     padding-top: 0;

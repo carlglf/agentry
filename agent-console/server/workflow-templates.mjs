@@ -149,6 +149,35 @@ export function builtinTemplates() {
   return clone({ roles: BUILTIN_ROLES, workflows: BUILTIN_WORKFLOWS, prompts: BUILTIN_PROMPTS });
 }
 
+// 阶段种类 → 作为权限/提示词基底的内置角色 id。
+export const STAGE_KIND_BASE_ROLE = {
+  development: "developer",
+  review: "reviewer",
+  testing: "tester",
+  doc: "doc",
+  planning: "planner",
+  integration: "integrator",
+};
+
+/**
+ * 由阶段种类合成一个自定义角色：权限/systemPrompt 取自该种类的内置角色（锁定，不接受外部覆盖），
+ * 仅允许自定义 id / 名称 / 默认运行时 / 默认模型。用于「同 kind 多角色」（如客户端开发、服务端开发）。
+ * 返回 null 表示该种类无对应内置基底（非法 kind）。
+ */
+export function synthesizeStageRole({ kind, roleId, name, defaultRuntime, defaultModel } = {}) {
+  const baseId = STAGE_KIND_BASE_ROLE[kind];
+  const base = baseId && BUILTIN_ROLES[baseId];
+  if (!base) return null;
+  const r = clone(base);
+  r.id = String(roleId || baseId);
+  if (name && String(name).trim()) r.name = String(name).trim();
+  if (defaultRuntime) r.defaultRuntime = defaultRuntime;
+  if (defaultModel) r.defaultModel = defaultModel;
+  // permissions 恒为该 kind 内置值（权限按阶段类型锁定，无提权面）。
+  r.permissions = clone(base.permissions);
+  return r;
+}
+
 function clone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
@@ -196,6 +225,19 @@ export function validateWorkflowTemplate(wf, roles) {
 
   const stages = Array.isArray(wf?.taskStages) ? wf.taskStages : [];
   if (stages.length === 0) errors.push("流程模板至少需要一个任务阶段");
+
+  // 阶段 id 必须唯一——引擎按 id 推进，重复 id 会导致定位歧义。允许同 kind 多阶段（如客户端/服务端开发）。
+  const seenStageIds = new Set();
+  for (const s of stages) {
+    const sid = String(s?.id || "").trim();
+    if (!sid) {
+      errors.push(`阶段「${s?.kind || "?"}」缺少 id`);
+    } else if (seenStageIds.has(sid)) {
+      errors.push(`阶段 id 重复：${sid}`);
+    } else {
+      seenStageIds.add(sid);
+    }
+  }
 
   // 每阶段有可用角色。
   for (const s of stages) {
@@ -262,6 +304,14 @@ export function applyWorkflowOverrides(workflow, overrides = {}) {
   if (overrides.integrationMode) {
     wf.settings.integrationMode = overrides.integrationMode;
   }
+  // 启动页可增删/排序角色：显式 taskStages 覆盖时整体替换阶段列表（kind 去重，与引擎约定一致）。
+  if (Array.isArray(overrides.taskStages) && overrides.taskStages.length) {
+    const seen = new Set();
+    wf.taskStages = overrides.taskStages
+      .filter((s) => s && s.kind && !seen.has(s.kind) && seen.add(s.kind))
+      .map((s) => ({ id: s.id || s.kind, kind: s.kind, roleId: s.roleId || s.kind }));
+    return wf;
+  }
   let stages = Array.isArray(wf.taskStages) ? [...wf.taskStages] : [];
   if (overrides.enableTesting === false) {
     stages = stages.filter((s) => s.kind !== "testing");
@@ -284,13 +334,14 @@ export function applyWorkflowOverrides(workflow, overrides = {}) {
 // ---- 合成与快照（PRD §9.4）----
 
 /**
- * 按优先级合成模板：内置 < 项目 .acg < 本次修改（overrides）。
+ * 按优先级合成模板：内置 < 项目 .acg < 自定义（用户另存的可复用模板）< 本次修改（overrides）。
  * 同 id 覆盖。返回 { roles, workflows, prompts, sources }，sources 记录每个 id 的最终来源。
  */
-export function resolveTemplates({ builtin, project, overrides } = {}) {
+export function resolveTemplates({ builtin, project, custom, overrides } = {}) {
   const layers = [
     { tag: "内置", data: builtin || {} },
     { tag: "项目 .acg", data: project || {} },
+    { tag: "自定义", data: custom || {} },
     { tag: "本次修改", data: overrides || {} },
   ];
   const roles = {};
@@ -335,9 +386,17 @@ export function snapshotTemplates({ resolved, workflowId, overrides }) {
 
   const roles = {};
   for (const id of roleIds) {
-    if (resolved.roles[id]) roles[id] = clone(resolved.roles[id]);
+    // 优先用 workflow 自带的角色定义（自定义运行方式自包含），回退到解析层。
+    const src = (baseWorkflow.roles && baseWorkflow.roles[id]) || resolved.roles[id];
+    if (src) roles[id] = clone(src);
   }
+  // 提示词：解析层为底，叠加该 workflow 自带 prompts（含自定义 planning 任务拆分提示词），按流程隔离。
   const prompts = clone(resolved.prompts);
+  if (baseWorkflow.prompts) {
+    for (const [k, v] of Object.entries(baseWorkflow.prompts)) {
+      if (v != null && String(v).trim()) prompts[k] = v;
+    }
+  }
 
   const sources = [];
   const pushSource = (kind, id, content) => {

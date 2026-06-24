@@ -142,6 +142,7 @@ export function createWorkflowStore({ dataDir }) {
       expectedFiles: Array.isArray(t.expectedFiles) ? t.expectedFiles : [],
       status: "pending",
       stage: null,
+      stageId: null,
       reviewRounds: 0,
       lastFindingIds: [],
       branch: "",
@@ -213,11 +214,19 @@ export function createWorkflowStore({ dataDir }) {
     return state.roleSessions.filter((s) => s.runId === runId).map((s) => ({ ...s }));
   }
 
-  /** 找某任务当前活动（未关闭）的开发会话。 */
-  function findActiveTaskSession(runId, taskId) {
+  /**
+   * 找某任务当前活动（未关闭）的开发会话。
+   * 传 stageId 时只匹配该阶段（用于同 kind 多阶段，如客户端/服务端开发各自独立会话）。
+   */
+  function findActiveTaskSession(runId, taskId, stageId) {
     ensureLoaded();
     const s = state.roleSessions.find(
-      (x) => x.runId === runId && x.taskId === taskId && x.status !== "completed" && x.status !== "terminated",
+      (x) =>
+        x.runId === runId &&
+        x.taskId === taskId &&
+        x.status !== "completed" &&
+        x.status !== "terminated" &&
+        (stageId == null || x.stageId === stageId),
     );
     return s ? { ...s } : null;
   }

@@ -7,7 +7,7 @@ import {
   validatePlan,
   pickNextTask,
   dependentsOf,
-  nextStage,
+  nextStageDescriptor,
   isStagePass,
   validateStageSubmission,
   applyReviewRound,
@@ -24,6 +24,8 @@ import {
   resolveTemplates,
   snapshotTemplates,
   validateResolvedWorkflow,
+  validateWorkflowTemplate,
+  synthesizeStageRole,
 } from "./workflow-templates.mjs";
 import {
   buildPlanningPrompt,
@@ -83,29 +85,123 @@ async function loadResolved(ctx, repoPath, overrides) {
   const builtin = builtinTemplates();
   const loader = ctx.loadProjectTemplates || loadProjectTemplates;
   const project = repoPath ? await loader(repoPath) : { roles: {}, workflows: {}, prompts: {}, sources: {}, errors: [] };
-  const resolved = resolveTemplates({ builtin, project, overrides });
+  // 用户另存的可复用自定义运行方式（落盘于 .data/workflow-templates.json）。
+  // 合并各模板的 workflows + 自带 roles（角色 id 全局唯一，无碰撞）；prompts 不全局合并，
+  // 由 snapshotTemplates 在选定某流程时叠加其自带 prompts（避免不同模板的 planning 提示词互相覆盖）。
+  let custom = {};
+  if (ctx.tplStore) {
+    const list = ctx.tplStore.list();
+    const workflows = {};
+    const roles = {};
+    for (const t of list) {
+      workflows[t.id] = t;
+      for (const [rid, r] of Object.entries(t.roles || {})) roles[rid] = r;
+    }
+    custom = { workflows, roles };
+  }
+  const resolved = resolveTemplates({ builtin, project, custom, overrides });
   return { resolved, projectErrors: project.errors || [] };
+}
+
+/**
+ * 由前端「阶段卡片列表 + 规划设置」组装一个自包含的自定义运行方式模板：
+ * - 每个任务阶段合成一个权限锁定（按 kind）的独立角色，roleId = 唯一阶段 id；
+ * - 人设/职责/运行时/模型 存入 roleBindings；规划角色 + 规划提示词写入 roleBindings.planner / prompts.planning。
+ * 返回 { tpl } 或 { error, code }。
+ */
+function buildCustomTemplateFromStages(body) {
+  const stages = body.stages || [];
+  if (!stages.length) return { error: "至少需要一个阶段", code: "no_stages" };
+  if (!stages.some((s) => s.kind === "development")) {
+    return { error: "至少需要一个开发阶段作为回退落点", code: "no_development" };
+  }
+  const roles = {};
+  const roleBindings = {};
+  const taskStages = [];
+  const usedIds = new Set();
+  for (let i = 0; i < stages.length; i++) {
+    const s = stages[i];
+    let base = String(s.id || "").trim() || `${s.kind}-${i + 1}`;
+    let sid = base;
+    let n = 2;
+    while (usedIds.has(sid)) sid = `${base}-${n++}`;
+    usedIds.add(sid);
+    const role = synthesizeStageRole({ kind: s.kind, roleId: sid, name: s.name, defaultRuntime: s.runtime, defaultModel: s.model });
+    if (!role) return { error: `非法的阶段类型：${s.kind}`, code: "bad_kind" };
+    roles[sid] = role;
+    roleBindings[sid] = {
+      runtime: s.runtime || role.defaultRuntime,
+      model: s.model || role.defaultModel,
+      persona: String(s.persona || "").trim(),
+      duty: String(s.duty || s.name || "").trim(),
+    };
+    taskStages.push({ id: sid, kind: s.kind, roleId: sid });
+  }
+
+  // 规划（任务拆分）：复用内置 planner 角色，叠加运行时/模型/人设/职责绑定与自定义规划提示词。
+  const planning = body.planning || {};
+  if (planning.runtime || planning.model || planning.persona || planning.duty) {
+    roleBindings.planner = {
+      runtime: planning.runtime || undefined,
+      model: planning.model || undefined,
+      persona: String(planning.persona || "").trim(),
+      duty: String(planning.duty || "").trim(),
+    };
+  }
+  const prompts = {};
+  if (planning.prompt && String(planning.prompt).trim()) prompts.planning = String(planning.prompt).trim();
+
+  return {
+    tpl: {
+      id: body.id,
+      name: body.name,
+      description: body.description,
+      baseWorkflowId: body.baseWorkflowId || null,
+      planningRoleId: "planner",
+      integrationRoleId: "integrator",
+      taskStages,
+      settings: {
+        maxReviewRounds: Number(body.settings?.maxReviewRounds) > 0 ? Number(body.settings.maxReviewRounds) : 3,
+        integrationMode: body.settings?.integrationMode === "direct_merge" ? "direct_merge" : "pull_request",
+      },
+      roleBindings,
+      roles,
+      prompts,
+    },
+  };
 }
 
 // ---- 阶段进入：拉起对应角色会话并注入提示词 ----
 
+/** 把入参规整为阶段对象 {id, kind, roleId}。支持传状态字符串（旧行为：取该 kind 的首个阶段）。 */
+function resolveStage(snapshot, stageOrStatus) {
+  if (stageOrStatus && typeof stageOrStatus === "object") return stageOrStatus;
+  const kind = stageKindFromStatus(stageOrStatus);
+  const stage = (snapshot.workflow.taskStages || []).find((s) => s.kind === kind);
+  return stage || { id: kind, kind, roleId: roleForKind(snapshot, kind) || kind };
+}
+
 /**
- * 让任务进入某状态（developing/reviewing/testing/documenting）：解析角色 → 复用/新建执行会话
+ * 让任务进入某阶段（按阶段对象，支持同 kind 多阶段）：解析每阶段独立角色 → 复用/新建执行会话
  * → 等待 TUI 就绪 → 注入裁剪后的阶段提示词。返回 { session, delivered }。
+ * stageOrStatus 可为阶段对象 {id,kind,roleId} 或状态字符串（兼容旧调用）。
  */
-async function enterStage(ctx, run, task, statusName, opts = {}) {
+async function enterStage(ctx, run, task, stageOrStatus, opts = {}) {
   const { wfStore, ptyMgr, gitRunner } = ctx;
   const snapshot = run.workflowSnapshot;
-  const kind = stageKindFromStatus(statusName);
-  const roleId = roleForKind(snapshot, kind) || kind;
+  const stage = resolveStage(snapshot, stageOrStatus);
+  const kind = stage.kind;
+  const stageId = stage.id || kind;
+  const statusName = statusFromStageKind(kind);
+  const roleId = stage.roleId || roleForKind(snapshot, kind) || kind;
   const rt = roleRuntime(snapshot, run, roleId);
   const allTasks = wfStore.listTasks(run.id);
   const handoffs = wfStore.listHandoffs(run.id);
 
-  // 开发（含修复循环）复用任务现有开发会话；review/test/doc 每阶段新建。
+  // 开发（含修复循环）复用该阶段已有开发会话（按阶段 id 区分客户端/服务端等多段开发）；review/test/doc 每阶段新建。
   let session;
   if (kind === "development") {
-    session = wfStore.findActiveTaskSession(run.id, task.id);
+    session = wfStore.findActiveTaskSession(run.id, task.id, stageId);
   }
   if (!session) {
     session = await wfStore.createRoleSession({
@@ -113,10 +209,10 @@ async function enterStage(ctx, run, task, statusName, opts = {}) {
       memberId: rt.memberId,
       roleId,
       taskId: task.id,
-      stageId: kind,
+      stageId,
     });
   } else {
-    await wfStore.updateRoleSession(session.id, { stageId: kind, status: "running" });
+    await wfStore.updateRoleSession(session.id, { stageId, status: "running" });
   }
 
   const cwd = taskCwd(run, task);
@@ -130,7 +226,7 @@ async function enterStage(ctx, run, task, statusName, opts = {}) {
     label: `${roleId}:${task.id}`,
     cwd,
     permissions,
-    env: workflowEnv(ctx, run, { roleId, taskId: task.id, stageId: kind, execSessionId: session.id, readonly }),
+    env: workflowEnv(ctx, run, { roleId, taskId: task.id, stageId, execSessionId: session.id, readonly }),
   });
 
   const context = computeTaskContext({ run, task, allTasks, handoffs });
@@ -170,8 +266,8 @@ async function enterStage(ctx, run, task, statusName, opts = {}) {
   if (ptyMgr.waitForReady) await ptyMgr.waitForReady(key, rt.runtime);
   const delivered = await ptyMgr.typeInto(key, preamble + prompt, rt.runtime);
 
-  await wfStore.updateTask(task.id, { status: statusName, stage: statusName });
-  await wfStore.updateRun(run.id, { currentStageId: kind, currentTaskId: task.id });
+  await wfStore.updateTask(task.id, { status: statusName, stage: statusName, stageId });
+  await wfStore.updateRun(run.id, { currentStageId: stageId, currentTaskId: task.id });
   return { session, delivered };
 }
 
@@ -271,8 +367,8 @@ async function advanceRun(ctx, run) {
     const branched = await ensureTaskBranch(ctx, run, next);
     if (!branched.ok) return;
     const fresh = wfStore.getTask(next.id);
-    const firstStatus = statusFromStageKind((run.workflowSnapshot.workflow.taskStages[0] || {}).kind) || "developing";
-    await enterStage(ctx, run, fresh, firstStatus);
+    const firstStage = (run.workflowSnapshot.workflow.taskStages || [])[0] || { id: "development", kind: "development", roleId: "developer" };
+    await enterStage(ctx, run, fresh, firstStage);
     await wfStore.updateRun(run.id, { status: "running" });
     return;
   }
@@ -414,7 +510,10 @@ async function reenterCurrent(ctx, run) {
   const task = run.currentTaskId ? wfStore.getTask(run.currentTaskId) : null;
   const stageStatus = task && task.status;
   if (task && stageKindFromStatus(stageStatus)) {
-    await enterStage(ctx, run, task, stageStatus);
+    // 优先按 task.stageId 还原确切阶段（支持同 kind 多阶段，如客户端/服务端开发），回退到状态。
+    const stages = (run.workflowSnapshot.workflow.taskStages || []);
+    const stage = (task.stageId && stages.find((s) => s.id === task.stageId)) || stageStatus;
+    await enterStage(ctx, run, task, stage);
     return;
   }
   await advanceRun(ctx, run);
@@ -471,11 +570,81 @@ export async function handleWorkflowApi(req, res, ctx) {
       taskStages: w.taskStages,
       planningRoleId: w.planningRoleId,
       integrationRoleId: w.integrationRoleId,
+      // 自定义模板携带复制来源、角色覆盖、角色定义与阶段提示词，供前端选中时预填编辑器。
+      baseWorkflowId: w.baseWorkflowId || null,
+      roleBindings: w.roleBindings || null,
+      roles: w.roles || null,
+      prompts: w.prompts || null,
       source: (resolved.sources[`workflow:${w.id}`] || {}).source || "内置",
       relativePath: (resolved.sources[`workflow:${w.id}`] || {}).relativePath || null,
     }));
     sendJson(res, 200, { workflows, roles: resolved.roles, errors: projectErrors });
     return true;
+  }
+
+  // ---- 自定义运行方式模板（以内置为模板复制再改后另存复用）----
+  if (p === "/api/workflow/custom-templates" && method === "POST") {
+    if (!ctx.tplStore) {
+      sendJson(res, 501, { error: "自定义模板存储未启用" });
+      return true;
+    }
+    const body = await readJson(req);
+    if (!String(body.name || "").trim()) {
+      sendJson(res, 400, { error: "请填写运行方式名称", code: "missing_name" });
+      return true;
+    }
+
+    let tpl;
+    if (Array.isArray(body.stages)) {
+      // 灵活形态：每个阶段自带类型 + 角色身份（名称/运行时/模型/人设/职责），允许同 kind 多角色。
+      const built = buildCustomTemplateFromStages(body);
+      if (built.error) {
+        sendJson(res, 400, { error: built.error, code: built.code || "invalid_workflow" });
+        return true;
+      }
+      tpl = built.tpl;
+    } else {
+      // 兼容旧形态：直接给 taskStages/roleBindings（引用内置 roleId）。
+      tpl = {
+        id: body.id,
+        name: body.name,
+        description: body.description,
+        baseWorkflowId: body.baseWorkflowId,
+        planningRoleId: body.planningRoleId,
+        integrationRoleId: body.integrationRoleId,
+        taskStages: body.taskStages,
+        settings: body.settings,
+        roleBindings: body.roleBindings,
+        roles: body.roles,
+        prompts: body.prompts,
+      };
+    }
+
+    // 用内置 + 项目 + 本模板自带角色校验该自定义流程合法（阶段有角色、有限重试上限、不绕过门槛、阶段 id 唯一等）。
+    // 校验要求 id 非空，而真正的 id 由存储分配，这里用占位 id 仅供校验。
+    const { resolved } = await loadResolved(ctx, body.repositoryPath || "");
+    const roleMap = { ...resolved.roles, ...(tpl.roles || {}) };
+    const check = validateWorkflowTemplate({ ...tpl, id: tpl.id || "custom-preview" }, roleMap);
+    if (!check.ok) {
+      sendJson(res, 400, { error: check.errors.join("；"), errors: check.errors, code: "invalid_workflow" });
+      return true;
+    }
+    const saved = await ctx.tplStore.create(tpl);
+    sendJson(res, 201, { template: saved });
+    return true;
+  }
+
+  {
+    const dm = p.match(/^\/api\/workflow\/custom-templates\/([^/]+)$/);
+    if (dm && method === "DELETE") {
+      if (!ctx.tplStore) {
+        sendJson(res, 501, { error: "自定义模板存储未启用" });
+        return true;
+      }
+      const ok = await ctx.tplStore.remove(decodeURIComponent(dm[1]));
+      sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: "模板不存在" });
+      return true;
+    }
   }
 
   // ---- 创建运行（含启动前预检 PRD §7.1）----
@@ -538,6 +707,21 @@ export async function handleWorkflowApi(req, res, ctx) {
       sendJson(res, 400, { error: err.message, code: err.code || "snapshot_failed" });
       return true;
     }
+    // 启动页改了阶段/角色（taskStages 覆盖）时，校验覆盖后的流程仍合法（保留开发回退落点、不绕过门槛等）。
+    if (Array.isArray(body.overrides?.taskStages) && body.overrides.taskStages.length) {
+      const wfCheck = validateWorkflowTemplate(snapshot.workflow, resolved.roles);
+      if (!wfCheck.ok) {
+        sendJson(res, 400, { error: wfCheck.errors.join("；"), errors: wfCheck.errors, code: "invalid_workflow" });
+        return true;
+      }
+    }
+
+    // 选中已保存的自定义模板时，把模板自带的角色绑定（运行时/模型/人设/职责）作为默认值，
+    // 再被本次请求显式传入的绑定覆盖，使自定义运行方式自包含、无需前端重复回传每个角色。
+    const savedTpl = ctx.tplStore ? ctx.tplStore.get(workflowId) : null;
+    const mergedBindings = { ...(savedTpl?.roleBindings || {}), ...((body.settings && body.settings.roleBindings) || {}) };
+    const mergedSettings = { ...(body.settings || {}) };
+    if (Object.keys(mergedBindings).length) mergedSettings.roleBindings = mergedBindings;
 
     const baseSha = gitRunner ? await safeVal(() => gitRunner.getHeadSha(repoPath, body.baseBranch || "HEAD"), "") : "";
     const run = await wfStore.createRun({
@@ -549,7 +733,7 @@ export async function handleWorkflowApi(req, res, ctx) {
       integrationMode: snapshot.workflow.settings.integrationMode,
       workflowTemplateId: workflowId,
       workflowSnapshot: snapshot,
-      settings: { ...(body.settings || {}), ...(body.overrides ? { overrides: body.overrides } : {}) },
+      settings: { ...mergedSettings, ...(body.overrides ? { overrides: body.overrides } : {}) },
       templateSources: snapshot.sources,
       autoMode: !!body.autoMode,
       status: "planning",
@@ -883,13 +1067,13 @@ async function handleStageSubmit(ctx, res, run, body) {
     return true;
   }
 
-  await wfStore.appendStageResult({ runId: run.id, taskId, stageId: stageKindFromStatus(task.stage), roleId, type, payload });
+  await wfStore.appendStageResult({ runId: run.id, taskId, stageId: task.stageId || stageKindFromStatus(task.stage), roleId, type, payload });
 
-  const nextStatus = nextStage(snapshot, task, payload);
-  const curKind = stageKindFromStatus(task.stage);
+  // 按阶段 id 推进（支持同 kind 多阶段，如客户端开发→服务端开发）。
+  const desc = nextStageDescriptor(snapshot, task, payload);
 
-  // 门槛失败：回退开发（fixing）。
-  if (nextStatus === "developing" && (curKind === "review" || curKind === "testing")) {
+  // 门槛失败：回退到首个开发阶段（fixing）。
+  if (desc.fix) {
     const round = applyReviewRound(task, payload, maxReviewRounds);
     await wfStore.updateTask(task.id, { reviewRounds: round.reviewRounds, lastFindingIds: round.prevFindingIds });
     if (round.atLimit) {
@@ -906,7 +1090,7 @@ async function handleStageSubmit(ctx, res, run, body) {
       return true;
     }
     const freshTask = wfStore.getTask(task.id);
-    const r = await enterStage(ctx, run, freshTask, "developing", {
+    const r = await enterStage(ctx, run, freshTask, desc.stage, {
       fix: true,
       findings: payload.findings || [],
       repeatedFindingIds: round.repeatedFindingIds,
@@ -923,7 +1107,7 @@ async function handleStageSubmit(ctx, res, run, body) {
   }
 
   // 走完全部阶段 → approved → 提交。
-  if (nextStatus === "approved") {
+  if (desc.done) {
     await wfStore.updateTask(task.id, { status: "approved", stage: "approved" });
     const committed = await commitTask(ctx, run, wfStore.getTask(task.id));
     if (!committed.ok) {
@@ -946,13 +1130,14 @@ async function handleStageSubmit(ctx, res, run, body) {
     return true;
   }
 
-  // 进入下一阶段（review/testing）。
+  // 进入下一阶段（含串联的下一段开发，如服务端开发；或 review/testing）。
   const freshTask = wfStore.getTask(task.id);
-  const r = await enterStage(ctx, run, freshTask, nextStatus, { devResult: payload, diffSummary: payload.changeSummary });
+  const r = await enterStage(ctx, run, freshTask, desc.stage, { devResult: payload, diffSummary: payload.changeSummary });
   sendJson(res, 200, {
     ok: true,
     advanced: true,
-    nextStage: nextStatus,
+    nextStage: statusFromStageKind(desc.stage.kind),
+    nextStageId: desc.stage.id,
     delivered: r.delivered,
     run: wfStore.getRun(run.id),
     task: wfStore.getTask(task.id),

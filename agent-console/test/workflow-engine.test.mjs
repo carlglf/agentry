@@ -4,6 +4,8 @@ import {
   pickNextTask,
   dependentsOf,
   nextStage,
+  nextStageDescriptor,
+  currentStageIndex,
   isStagePass,
   validateStageSubmission,
   applyReviewRound,
@@ -145,6 +147,45 @@ describe("nextStage 任务阶段状态机", () => {
     expect(
       nextStage(lightSnapshot, task({ stage: "reviewing" }), { verdict: "approved" }),
     ).toBe("approved");
+  });
+});
+
+// 同 kind 多阶段：客户端开发 → 服务端开发 → Review。按阶段 id 推进。
+const multiDevSnapshot = {
+  workflow: {
+    taskStages: [
+      { id: "client-dev", kind: "development", roleId: "client-dev" },
+      { id: "server-dev", kind: "development", roleId: "server-dev" },
+      { id: "review", kind: "review", roleId: "reviewer" },
+    ],
+    settings: { maxReviewRounds: 3, integrationMode: "pull_request" },
+  },
+};
+
+describe("nextStageDescriptor 同 kind 多阶段（客户端→服务端开发）", () => {
+  it("客户端开发提交 → 进入服务端开发（按 stageId 区分，而非按 kind 回到首个）", () => {
+    const d = nextStageDescriptor(multiDevSnapshot, task({ stageId: "client-dev", status: "developing", stage: "developing" }), {});
+    expect(d.stage.id).toBe("server-dev");
+    expect(d.done).toBeFalsy();
+    expect(d.fix).toBeFalsy();
+  });
+  it("服务端开发提交 → 进入 Review", () => {
+    const d = nextStageDescriptor(multiDevSnapshot, task({ stageId: "server-dev", status: "developing", stage: "developing" }), {});
+    expect(d.stage.id).toBe("review");
+  });
+  it("Review 打回 → fix 回到首个开发阶段（客户端开发）", () => {
+    const d = nextStageDescriptor(multiDevSnapshot, task({ stageId: "review", status: "reviewing", stage: "reviewing" }), { verdict: "changes_requested" });
+    expect(d.fix).toBe(true);
+    expect(d.stage.id).toBe("client-dev");
+  });
+  it("Review 通过 → done（走完全部阶段）", () => {
+    const d = nextStageDescriptor(multiDevSnapshot, task({ stageId: "review", status: "reviewing", stage: "reviewing" }), { verdict: "approved" });
+    expect(d.done).toBe(true);
+  });
+  it("currentStageIndex 优先按 stageId 定位（同 kind 多阶段不歧义）", () => {
+    expect(currentStageIndex(multiDevSnapshot, task({ stageId: "server-dev", status: "developing" }))).toBe(1);
+    // 无 stageId 时回退到按状态推 kind（取首个 development）
+    expect(currentStageIndex(multiDevSnapshot, task({ status: "developing" }))).toBe(0);
   });
 });
 

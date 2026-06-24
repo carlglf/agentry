@@ -110,6 +110,17 @@ describe("applyWorkflowOverrides", () => {
     expect(wf.settings.maxReviewRounds).toBe(5);
     expect(wf.settings.integrationMode).toBe("direct_merge");
   });
+  it("显式 taskStages 覆盖整体替换阶段列表（增删/排序角色）并对 kind 去重", () => {
+    const wf = applyWorkflowOverrides(BUILTIN_WORKFLOWS["standard-dev"], {
+      taskStages: [
+        { id: "development", kind: "development", roleId: "developer" },
+        { id: "doc", kind: "doc", roleId: "doc" },
+        { id: "dup", kind: "doc", roleId: "doc" },
+      ],
+    });
+    expect(wf.taskStages.map((s) => s.kind)).toEqual(["development", "doc"]);
+    expect(validateWorkflowTemplate(wf, BUILTIN_ROLES).ok).toBe(true);
+  });
 });
 
 describe("resolveTemplates + snapshotTemplates", () => {

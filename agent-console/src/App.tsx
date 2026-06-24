@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Clipboard,
   Code2,
   Copy,
@@ -49,6 +50,8 @@ import { persist } from "zustand/middleware";
 
 type AgentStatus = "online" | "offline" | "running" | "error" | "paused";
 type AgentRuntime = "codex" | "claude";
+// 普通 Agent vs 需求澄清助手：澄清助手会被注入澄清框架提示词，并在判定需求明确后给出「去开发」入口。
+type AgentKind = "normal" | "clarifier";
 type CommandScope = "global" | "project" | "agent";
 type CommandAction = "insert" | "send";
 type MessageRole = "user" | "agent" | "system";
@@ -78,6 +81,7 @@ type Agent = {
   model: string;
   description: string;
   status: AgentStatus;
+  kind?: AgentKind;
   workdir: string;
   startCommand: string;
   env: Record<string, string>;
@@ -107,6 +111,9 @@ type Message = {
   content: string;
   messageType: MessageType;
   status: MessageStatus;
+  // 澄清助手判定「需求已明确」时置位，devSpec 为提炼出的《需求说明书》，用于「去开发」预填。
+  devReady?: boolean;
+  devSpec?: string;
   createdAt: string;
 };
 
@@ -231,6 +238,7 @@ type AgentForm = {
   workdir: string;
   startCommand: string;
   status: AgentStatus;
+  kind: AgentKind;
 };
 
 type CommandForm = {
@@ -271,6 +279,35 @@ const now = () => new Date().toISOString();
 const id = (prefix: string) =>
   `${prefix}_${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
 const defaultRootPath = "/mnt/h/ai/orchestration";
+
+// ---- 需求澄清助手 ----
+// 澄清助手在判定需求已明确时，在回复最后单独一行输出该标记；前端据此显示「去开发」按钮。
+// 使用纯 ASCII 标记，避免被 TTY 清洗逻辑改写。
+const DEV_READY_TOKEN = "@@READY_FOR_DEV@@";
+// 注入到澄清助手 PTY 的开场框架提示词（仅进入 PTY，不展示给用户）。
+const CLARIFIER_FRAMING = [
+  "你现在是一个「需求澄清助手」。用户会用一句话或一段话描述他想做的功能，但通常并不完整。",
+  "你的职责是：通过有针对性的提问，把模糊需求澄清成一份可直接进入开发的明确需求。",
+  "",
+  "请遵守：",
+  "1. 一次只问最关键的 2-4 个问题，聚焦在：目标用户与场景、功能范围（做什么/不做什么）、关键约束（平台/技术/数据）、验收标准。不要一次抛出太多问题。",
+  "2. 根据用户回答持续追问，直到需求足够明确、没有重大歧义为止。",
+  "3. 当且仅当需求已经足够明确、可以进入开发时，先用 Markdown 输出一份《需求说明书》，包含：目标、范围、关键功能点、约束、验收标准。",
+  `4. 在《需求说明书》之后，另起一行，单独输出且仅输出这一行标记（不要加引号、代码块或任何其它字符）：${DEV_READY_TOKEN}`,
+  "5. 在需求尚未明确之前，绝对不要输出该标记。",
+  "6. 全程使用中文回复。",
+  "",
+  "下面是用户的初始需求：",
+].join("\n");
+
+// 从澄清助手回复中检测「需求已明确」标记，返回展示文本（去标记）与提炼出的需求说明书。
+function detectDevReady(content: string): { ready: boolean; display: string; spec: string } {
+  const idx = content.indexOf(DEV_READY_TOKEN);
+  if (idx === -1) return { ready: false, display: content, spec: "" };
+  const spec = content.slice(0, idx).trim();
+  const display = content.split(DEV_READY_TOKEN).join("").trim();
+  return { ready: true, display, spec: spec || display };
+}
 
 const agentRuntimeOptions: Record<AgentRuntime, { label: string; defaultModel: string; models: Array<{ value: string; label: string }> }> = {
   codex: {
@@ -842,6 +879,7 @@ const useConsoleStore = create<ConsoleStore>()(
                 model: form.model,
                 description: form.description.trim(),
                 status: form.status,
+                kind: form.kind || "normal",
                 workdir: form.workdir.trim() || project?.rootPath || defaultRootPath,
                 startCommand: form.startCommand.trim(),
                 env: {},
@@ -868,6 +906,7 @@ const useConsoleStore = create<ConsoleStore>()(
                   model: form.model,
                   description: form.description.trim(),
                   status: form.status,
+                  kind: form.kind || "normal",
                   workdir: form.workdir.trim() || defaultRootPath,
                   startCommand: form.startCommand.trim(),
                   updatedAt: now(),
@@ -976,6 +1015,7 @@ const emptyAgentForm: AgentForm = {
   workdir: defaultRootPath,
   startCommand: defaultStartCommand("codex", agentRuntimeOptions.codex.defaultModel),
   status: "offline",
+  kind: "normal",
 };
 
 const emptyCommandForm: CommandForm = {
@@ -1252,6 +1292,11 @@ type WorkflowTemplateSummary = {
   taskStages: Array<{ id: string; kind: string; roleId: string }>;
   planningRoleId?: string;
   integrationRoleId?: string;
+  // 自定义运行方式：复制来源的内置流程 id + 角色覆盖/定义/阶段提示词，供选中时预填编辑器。
+  baseWorkflowId?: string | null;
+  roleBindings?: Record<string, RoleBinding> | null;
+  roles?: Record<string, { name?: string }> | null;
+  prompts?: Record<string, string> | null;
   source: string;
   relativePath: string | null;
 };
@@ -1264,6 +1309,22 @@ const WORKFLOW_ROLE_LABEL: Record<string, string> = {
   integrator: "集成",
   doc: "文档",
 };
+
+// 任务阶段种类（与角色一一对应）。引擎以 kind 识别阶段，故每种最多出现一次。
+// development 为必需回退落点；planning/integration 是结构性固定角色，不在此可增删列表内。
+const WORKFLOW_STAGE_KIND_LABEL: Record<string, string> = {
+  development: "开发",
+  review: "Review",
+  testing: "测试",
+  doc: "文档",
+};
+const STAGE_KIND_TO_ROLE: Record<string, string> = {
+  development: "developer",
+  review: "reviewer",
+  testing: "tester",
+  doc: "doc",
+};
+const ALL_STAGE_KINDS = ["development", "review", "testing", "doc"];
 
 type RoleBinding = { memberId?: string; runtime?: string; model?: string; persona?: string; duty?: string };
 type WorkflowRoleSource = "builtin" | "custom" | "group";
@@ -1278,7 +1339,33 @@ type CreateRunPayload = {
   workflowTemplateId: string;
   groupId?: string;
   settings?: { roleBindings?: Record<string, RoleBinding> };
-  overrides: { maxReviewRounds?: number; enableTesting?: boolean; enableDoc?: boolean; integrationMode?: "pull_request" | "direct_merge" };
+  overrides: {
+    maxReviewRounds?: number;
+    enableTesting?: boolean;
+    enableDoc?: boolean;
+    integrationMode?: "pull_request" | "direct_merge";
+    taskStages?: Array<{ id: string; kind: string; roleId: string }>;
+  };
+};
+
+// 灵活自定义运行方式：阶段卡片（每个含类型+角色身份，允许同类型多角色）+ 任务拆分（规划）。
+type SaveStageInput = {
+  kind: string;
+  name: string;
+  runtime: string;
+  model: string;
+  persona: string;
+  duty: string;
+};
+type SaveCustomTemplatePayload = {
+  id?: string; // 传则覆盖更新，否则新建
+  name: string;
+  description: string;
+  baseWorkflowId?: string | null;
+  stages: SaveStageInput[];
+  planning: { runtime: string; model: string; persona: string; duty: string; prompt: string };
+  settings: { maxReviewRounds: number; integrationMode: "pull_request" | "direct_merge" };
+  repositoryPath: string;
 };
 
 const WORKFLOW_RUN_STATUS_LABEL: Record<WorkflowRunStatus, string> = {
@@ -1322,12 +1409,16 @@ type WorkflowStore = {
   runsByProject: Record<string, WorkflowRun[]>;
   selectedRunId: string;
   creatingForProjectId: string;
+  // 「去开发」携带的澄清产物，用于预填新建运行的目标；普通新建时为空串。
+  wizardInitialGoal: string;
   detail: WorkflowDetail | null;
   templates: WorkflowTemplateSummary[];
   templateErrors: string[];
   loadRuns: (projectId: string) => Promise<void>;
   loadTemplates: (repoPath: string) => Promise<void>;
-  startCreate: (projectId: string) => void;
+  saveCustomTemplate: (payload: SaveCustomTemplatePayload) => Promise<WorkflowTemplateSummary>;
+  deleteCustomTemplate: (id: string, repoPath: string) => Promise<void>;
+  startCreate: (projectId: string, initialGoal?: string) => void;
   cancelCreate: () => void;
   createRun: (payload: CreateRunPayload) => Promise<WorkflowRun>;
   selectRun: (runId: string) => Promise<void>;
@@ -1349,6 +1440,7 @@ const useWorkflowStore = create<WorkflowStore>((set, get) => ({
   runsByProject: {},
   selectedRunId: "",
   creatingForProjectId: "",
+  wizardInitialGoal: "",
   detail: null,
   templates: [],
   templateErrors: [],
@@ -1362,7 +1454,20 @@ const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     );
     set({ templates: data.workflows, templateErrors: data.errors || [] });
   },
-  startCreate: (projectId) => set({ creatingForProjectId: projectId, selectedRunId: "", detail: null }),
+  saveCustomTemplate: async (payload) => {
+    const data = await discussionApi<{ template: WorkflowTemplateSummary }>("/workflow/custom-templates", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    await get().loadTemplates(payload.repositoryPath);
+    return data.template;
+  },
+  deleteCustomTemplate: async (id, repoPath) => {
+    await discussionApi(`/workflow/custom-templates/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await get().loadTemplates(repoPath);
+  },
+  startCreate: (projectId, initialGoal = "") =>
+    set({ creatingForProjectId: projectId, wizardInitialGoal: initialGoal, selectedRunId: "", detail: null }),
   cancelCreate: () => set({ creatingForProjectId: "" }),
   createRun: async (payload) => {
     const data = await discussionApi<{ run: WorkflowRun }>("/workflow/runs", {
@@ -1491,6 +1596,7 @@ export function App() {
   const selectedSessionId = useDiscussionStore((state) => state.selectedSessionId);
   const selectedRunId = useWorkflowStore((state) => state.selectedRunId);
   const creatingForProjectId = useWorkflowStore((state) => state.creatingForProjectId);
+  const startCreateRun = useWorkflowStore((state) => state.startCreate);
   const loadGroups = useDiscussionStore((state) => state.loadGroups);
   const loadRuntimeMeta = useRuntimeMetaStore((state) => state.load);
   useEffect(() => {
@@ -1510,21 +1616,25 @@ export function App() {
 
   const handleTtyResponse = useCallback(
     (response: TtyResponse) => {
-      const content = normalizeMessageContent(response.content);
-      if (content) {
+      const raw = normalizeMessageContent(response.content);
+      if (raw) {
+        const isClarifier =
+          useConsoleStore.getState().agents.find((agent) => agent.id === response.agentId)?.kind === "clarifier";
+        const detected = isClarifier ? detectDevReady(raw) : { ready: false, display: raw, spec: "" };
         addMessage({
           projectId: response.projectId,
           agentId: response.agentId,
           role: "agent",
-          content,
+          content: detected.display,
           messageType: "text",
           status: "success",
+          ...(detected.ready ? { devReady: true, devSpec: detected.spec } : {}),
         });
         addTerminalLog({
           projectId: response.projectId,
           agentId: response.agentId,
           level: "info",
-          content,
+          content: raw,
         });
       }
       processingRef.current = false;
@@ -1537,6 +1647,10 @@ export function App() {
     const content = raw.trim();
     if (!content || !selectedProject || !selectedAgent) return;
     if (processingRef.current) return;
+
+    // 澄清助手的首轮对话：把澄清框架提示词注入 PTY（不展示给用户），后续轮次不再注入。
+    const needsPrime = selectedAgent.kind === "clarifier" && agentMessages.length === 0;
+    const ptyText = needsPrime ? `${CLARIFIER_FRAMING}\n${content}` : content;
 
     const messageType: MessageType = content.startsWith("/") ? "command" : "text";
     addMessage({
@@ -1551,7 +1665,7 @@ export function App() {
     processingRef.current = true;
     setProcessing(true);
 
-    const sent = (await ttyBridgeRef.current?.send(content)) ?? false;
+    const sent = (await ttyBridgeRef.current?.send(ptyText)) ?? false;
     if (!sent) {
       addMessage({
         projectId: selectedProject.id,
@@ -1607,6 +1721,9 @@ export function App() {
                 onDeleteCommand={(command) => setModal({ type: "confirm-delete-command", command })}
                 onAddCommand={() => setModal({ type: "command" })}
                 onClear={() => selectedAgent && clearMessages(selectedAgent.id)}
+                onGoDev={(message) => {
+                  if (selectedProject) startCreateRun(selectedProject.id, message.devSpec || message.content);
+                }}
               />
               <TerminalPanel
                 selectedAgent={selectedAgent}
@@ -2461,11 +2578,386 @@ function WorkflowTree({ project }: { project: Project }) {
   );
 }
 
+// ---- 灵活自定义运行方式编辑器 ----
+
+type EditStageRow = { uid: string; kind: string; name: string; runtime: AgentRuntime; model: string; persona: string; duty: string };
+type EditorSeed = {
+  id?: string;
+  name: string;
+  description: string;
+  baseWorkflowId?: string | null;
+  stages: EditStageRow[];
+  planning: { runtime: AgentRuntime; model: string; persona: string; duty: string; prompt: string };
+  maxReviewRounds: number;
+  integrationMode: "pull_request" | "direct_merge";
+};
+
+let __editUidSeq = 0;
+function editUid() {
+  __editUidSeq += 1;
+  return `es-${__editUidSeq}-${Math.floor(Math.random() * 1e6)}`;
+}
+
+type RuntimeOptions = ReturnType<typeof useRuntimeMetaStore.getState>["options"];
+
+/** 由一个运行方式（内置或自定义）构造编辑器种子。copy=true 时不带 id（另存为新模板）。 */
+function seedFromTemplate(tpl: WorkflowTemplateSummary, opts: { copy?: boolean }, ro: RuntimeOptions): EditorSeed {
+  const defRuntime: AgentRuntime = "codex";
+  const stages: EditStageRow[] = (tpl.taskStages || []).map((s) => {
+    const binding = tpl.roleBindings?.[s.roleId];
+    const runtime = ((binding?.runtime as AgentRuntime) || defRuntime) as AgentRuntime;
+    const roleName = tpl.roles?.[s.roleId]?.name;
+    return {
+      uid: editUid(),
+      kind: s.kind,
+      name: roleName || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind,
+      runtime,
+      model: binding?.model || ro[runtime].defaultModel,
+      persona: binding?.persona || "",
+      duty: binding?.duty || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind,
+    };
+  });
+  const pBind = tpl.roleBindings?.planner;
+  const pRuntime = ((pBind?.runtime as AgentRuntime) || defRuntime) as AgentRuntime;
+  return {
+    id: opts.copy ? undefined : tpl.source === "自定义" ? tpl.id : undefined,
+    name: opts.copy || tpl.source !== "自定义" ? `${tpl.name} 副本` : tpl.name,
+    description: tpl.description || "",
+    baseWorkflowId: tpl.baseWorkflowId || tpl.id,
+    stages: stages.length ? stages : [defaultStageRow("development", ro)],
+    planning: {
+      runtime: pRuntime,
+      model: pBind?.model || ro[pRuntime].defaultModel,
+      persona: pBind?.persona || "",
+      duty: pBind?.duty || "",
+      prompt: tpl.prompts?.planning || "",
+    },
+    maxReviewRounds: tpl.settings?.maxReviewRounds || 3,
+    integrationMode: tpl.settings?.integrationMode || "pull_request",
+  };
+}
+
+function defaultStageRow(kind: string, ro: RuntimeOptions): EditStageRow {
+  return {
+    uid: editUid(),
+    kind,
+    name: WORKFLOW_STAGE_KIND_LABEL[kind] || kind,
+    runtime: "codex",
+    model: ro.codex.defaultModel,
+    persona: "",
+    duty: WORKFLOW_STAGE_KIND_LABEL[kind] || kind,
+  };
+}
+
+function CustomMethodEditor({
+  seed,
+  repoPath,
+  onCancel,
+  onSaved,
+}: {
+  seed: EditorSeed;
+  repoPath: string;
+  onCancel: () => void;
+  onSaved: (tpl: WorkflowTemplateSummary) => void;
+}) {
+  const runtimeOptions = useRuntimeMetaStore((state) => state.options);
+  const saveCustomTemplate = useWorkflowStore((state) => state.saveCustomTemplate);
+  const [name, setName] = useState(seed.name);
+  const [description, setDescription] = useState(seed.description);
+  const [stages, setStages] = useState<EditStageRow[]>(seed.stages);
+  const [planning, setPlanning] = useState(seed.planning);
+  const [maxReviewRounds, setMaxReviewRounds] = useState(seed.maxReviewRounds);
+  const [integrationMode, setIntegrationMode] = useState(seed.integrationMode);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  function patchStage(uid: string, patch: Partial<EditStageRow>) {
+    setStages((prev) => prev.map((s) => (s.uid === uid ? { ...s, ...patch } : s)));
+  }
+  function addStage(kind: string) {
+    setStages((prev) => [...prev, defaultStageRow(kind, runtimeOptions)]);
+  }
+  function removeStage(uid: string) {
+    setStages((prev) => {
+      const target = prev.find((s) => s.uid === uid);
+      // 至少保留一个开发阶段作为回退落点。
+      if (target?.kind === "development" && prev.filter((s) => s.kind === "development").length <= 1) return prev;
+      return prev.filter((s) => s.uid !== uid);
+    });
+  }
+  function moveStage(idx: number, dir: -1 | 1) {
+    setStages((prev) => {
+      const j = idx + dir;
+      if (j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[idx], next[j]] = [next[j], next[idx]];
+      return next;
+    });
+  }
+
+  async function submit() {
+    setError("");
+    if (!name.trim()) {
+      setError("请填写运行方式名称");
+      return;
+    }
+    if (!stages.some((s) => s.kind === "development")) {
+      setError("至少需要一个开发角色作为回退落点");
+      return;
+    }
+    setBusy(true);
+    try {
+      const tpl = await saveCustomTemplate({
+        id: seed.id,
+        name: name.trim(),
+        description: description.trim(),
+        baseWorkflowId: seed.baseWorkflowId,
+        stages: stages.map((s) => ({
+          kind: s.kind,
+          name: s.name.trim() || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind,
+          runtime: s.runtime,
+          model: s.model,
+          persona: s.persona.trim(),
+          duty: s.duty.trim(),
+        })),
+        planning: {
+          runtime: planning.runtime,
+          model: planning.model,
+          persona: planning.persona.trim(),
+          duty: planning.duty.trim(),
+          prompt: planning.prompt.trim(),
+        },
+        settings: { maxReviewRounds, integrationMode },
+        repositoryPath: repoPath,
+      });
+      onSaved(tpl);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="wf-editor">
+      <div className="wf-editor-head">
+        <strong>{seed.id ? "编辑自定义运行方式" : "新建自定义运行方式"}</strong>
+        <span className="wf-editor-hint">阶段即角色，可加任意数量（如客户端开发、服务端开发、全栈开发…），权限按类型自动锁定。</span>
+      </div>
+
+      <div className="wf-field-row">
+        <label className="wf-field">
+          <span>名称</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：前后端分离流程" />
+        </label>
+        <label className="wf-field">
+          <span>描述</span>
+          <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="可选，简述适用场景" />
+        </label>
+      </div>
+
+      <div className="wf-field">
+        <span className="wf-field-head">
+          角色 / 阶段（按顺序执行）
+          <select
+            className="wf-stage-add"
+            value=""
+            onChange={(e) => {
+              if (e.target.value) addStage(e.target.value);
+              e.target.value = "";
+            }}
+          >
+            <option value="">+ 添加角色…</option>
+            {ALL_STAGE_KINDS.map((k) => (
+              <option key={k} value={k}>
+                {WORKFLOW_STAGE_KIND_LABEL[k] || k}
+              </option>
+            ))}
+          </select>
+        </span>
+        <div className="wf-custom-roles">
+          {stages.map((s, i) => (
+            <div className="wf-custom-role wf-stage-editor-card" key={s.uid}>
+              <div className="wf-custom-role-title">
+                <span>
+                  {i + 1}. {WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind}
+                </span>
+                <span className="wf-stage-ops">
+                  <button type="button" title="上移" disabled={i === 0} onClick={() => moveStage(i, -1)}>
+                    <ChevronUp size={13} />
+                  </button>
+                  <button type="button" title="下移" disabled={i === stages.length - 1} onClick={() => moveStage(i, 1)}>
+                    <ChevronDown size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    title={s.kind === "development" ? "至少保留一个开发角色" : "删除该角色"}
+                    onClick={() => removeStage(s.uid)}
+                  >
+                    <X size={13} />
+                  </button>
+                </span>
+              </div>
+              <div className="wf-field-row">
+                <label className="wf-field">
+                  <span>类型</span>
+                  <select value={s.kind} onChange={(e) => patchStage(s.uid, { kind: e.target.value })}>
+                    {ALL_STAGE_KINDS.map((k) => (
+                      <option key={k} value={k}>
+                        {WORKFLOW_STAGE_KIND_LABEL[k] || k}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="wf-field">
+                  <span>名称</span>
+                  <input value={s.name} onChange={(e) => patchStage(s.uid, { name: e.target.value })} placeholder="如：客户端开发" />
+                </label>
+              </div>
+              <div className="wf-field-row">
+                <label className="wf-field">
+                  <span>运行时</span>
+                  <select
+                    value={s.runtime}
+                    onChange={(e) => {
+                      const runtime = e.target.value as AgentRuntime;
+                      patchStage(s.uid, { runtime, model: runtimeOptions[runtime].defaultModel });
+                    }}
+                  >
+                    {(Object.keys(agentRuntimeOptions) as AgentRuntime[]).map((key) => (
+                      <option key={key} value={key}>
+                        {agentRuntimeOptions[key].label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="wf-field">
+                  <span>模型</span>
+                  <select value={s.model} onChange={(e) => patchStage(s.uid, { model: e.target.value })}>
+                    {runtimeOptions[s.runtime].models.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                    {!runtimeOptions[s.runtime].models.some((opt) => opt.value === s.model) && s.model ? (
+                      <option value={s.model}>{s.model}</option>
+                    ) : null}
+                  </select>
+                </label>
+              </div>
+              <label className="wf-field">
+                <span>职责</span>
+                <input value={s.duty} onChange={(e) => patchStage(s.uid, { duty: e.target.value })} placeholder="如：只实现客户端代码" />
+              </label>
+              <label className="wf-field">
+                <span>人设</span>
+                <textarea
+                  rows={2}
+                  value={s.persona}
+                  onChange={(e) => patchStage(s.uid, { persona: e.target.value })}
+                  placeholder="例如：只负责前端，不改服务端代码"
+                />
+              </label>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="wf-field">
+        <span>任务拆分（规划角色）</span>
+        <div className="wf-custom-role wf-planning-editor-card">
+          <div className="wf-field-row">
+            <label className="wf-field">
+              <span>运行时</span>
+              <select
+                value={planning.runtime}
+                onChange={(e) => {
+                  const runtime = e.target.value as AgentRuntime;
+                  setPlanning((p) => ({ ...p, runtime, model: runtimeOptions[runtime].defaultModel }));
+                }}
+              >
+                {(Object.keys(agentRuntimeOptions) as AgentRuntime[]).map((key) => (
+                  <option key={key} value={key}>
+                    {agentRuntimeOptions[key].label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="wf-field">
+              <span>模型</span>
+              <select value={planning.model} onChange={(e) => setPlanning((p) => ({ ...p, model: e.target.value }))}>
+                {runtimeOptions[planning.runtime].models.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+                {!runtimeOptions[planning.runtime].models.some((opt) => opt.value === planning.model) && planning.model ? (
+                  <option value={planning.model}>{planning.model}</option>
+                ) : null}
+              </select>
+            </label>
+          </div>
+          <label className="wf-field">
+            <span>职责</span>
+            <input value={planning.duty} onChange={(e) => setPlanning((p) => ({ ...p, duty: e.target.value }))} placeholder="如：把目标拆成客户端任务与服务端任务" />
+          </label>
+          <label className="wf-field">
+            <span>规划提示词（任务拆分规则，可选）</span>
+            <textarea
+              rows={3}
+              value={planning.prompt}
+              onChange={(e) => setPlanning((p) => ({ ...p, prompt: e.target.value }))}
+              placeholder="留空用内置规划提示词；可写明如何把开发目标拆成子任务、按端/模块切分等。"
+            />
+          </label>
+        </div>
+      </div>
+
+      <div className="wf-field-row">
+        <label className="wf-field">
+          <span>集成方式</span>
+          <select value={integrationMode} onChange={(e) => setIntegrationMode(e.target.value as "pull_request" | "direct_merge")}>
+            <option value="pull_request">创建 PR</option>
+            <option value="direct_merge">直接合并</option>
+          </select>
+        </label>
+        <label className="wf-field">
+          <span>最大 Review/修改轮次</span>
+          <input
+            type="number"
+            min={1}
+            value={maxReviewRounds}
+            onChange={(e) => setMaxReviewRounds(Math.max(1, Number(e.target.value) || 1))}
+          />
+        </label>
+      </div>
+
+      <div className="wf-summary">
+        最终流程：规划 → {stages.map((s) => s.name || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind).join(" → ")} → 提交 → 集成（
+        {integrationMode === "pull_request" ? "PR" : "直接合并"}）
+      </div>
+
+      {error && <div className="wf-error">{error}</div>}
+
+      <div className="wf-save-tpl-actions">
+        <button className="ghost-button" type="button" onClick={onCancel} disabled={busy}>
+          取消
+        </button>
+        <button className="primary-button" type="button" onClick={() => void submit()} disabled={busy}>
+          {busy ? "保存中…" : seed.id ? "保存修改" : "保存为运行方式"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function CreateRunWizard({ projectId }: { projectId: string }) {
   const project = useConsoleStore((state) => state.projects.find((p) => p.id === projectId));
   const templates = useWorkflowStore((state) => state.templates);
   const templateErrors = useWorkflowStore((state) => state.templateErrors);
   const loadTemplates = useWorkflowStore((state) => state.loadTemplates);
+  const saveCustomTemplate = useWorkflowStore((state) => state.saveCustomTemplate);
+  const deleteCustomTemplate = useWorkflowStore((state) => state.deleteCustomTemplate);
   const createRun = useWorkflowStore((state) => state.createRun);
   const cancelCreate = useWorkflowStore((state) => state.cancelCreate);
   const runtimeOptions = useRuntimeMetaStore((state) => state.options);
@@ -2473,14 +2965,14 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
   const loadGroups = useDiscussionStore((state) => state.loadGroups);
   const groups = useMemo(() => allGroups.filter((g) => g.projectId === projectId), [allGroups, projectId]);
 
-  const [goal, setGoal] = useState("");
+  const [goal, setGoal] = useState(() => useWorkflowStore.getState().wizardInitialGoal || "");
   const [repoPath, setRepoPath] = useState(project?.rootPath || "");
   const [baseBranch, setBaseBranch] = useState("main");
   const [integrationMode, setIntegrationMode] = useState<"pull_request" | "direct_merge">("pull_request");
   const [templateId, setTemplateId] = useState("");
   const [maxReviewRounds, setMaxReviewRounds] = useState(3);
-  const [enableTesting, setEnableTesting] = useState(true);
-  const [enableDoc, setEnableDoc] = useState(false);
+  // 可增删/排序的任务阶段（角色）种类，有序；始终含 development。
+  const [taskKinds, setTaskKinds] = useState<string[]>(["development", "review", "testing"]);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [roleSource, setRoleSource] = useState<WorkflowRoleSource>("builtin");
   const [groupId, setGroupId] = useState("");
@@ -2489,6 +2981,8 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
   const [customRoles, setCustomRoles] = useState<Record<string, CustomWorkflowRole>>({});
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 灵活自定义运行方式编辑器（打开时承载种子，关闭为 null）。
+  const [editorSeed, setEditorSeed] = useState<EditorSeed | null>(null);
 
   useEffect(() => {
     void loadTemplates(repoPath).catch(() => undefined);
@@ -2502,23 +2996,39 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
     if (templates.length && !templateId) {
       const std = templates.find((t) => t.id === "standard-dev") || templates[0];
       setTemplateId(std.id);
-      setEnableTesting(std.taskStages.some((s) => s.kind === "testing"));
+      setTaskKinds(std.taskStages.map((s) => s.kind));
     }
   }, [templates, templateId]);
 
   const selectedTemplate = templates.find((t) => t.id === templateId);
+  const isCustomSel = selectedTemplate?.source === "自定义";
   const selectedGroup = roleSource === "group" ? groups.find((g) => g.id === groupId) : undefined;
 
-  // 当前模板涉及的角色（规划 + 各任务阶段 + 集成），去重。
+  // 选择运行方式卡片：同步阶段/角色列表、最大轮次、集成方式。
+  // 自定义模板是自包含的（阶段/角色/规划已随模板保存），不走这里的「执行角色」逐角色覆盖，改用编辑器维护。
+  function selectTemplate(tpl: WorkflowTemplateSummary) {
+    setTemplateId(tpl.id);
+    setEditorSeed(null);
+    setTaskKinds(tpl.taskStages.map((s) => s.kind));
+    if (tpl.settings?.maxReviewRounds) setMaxReviewRounds(tpl.settings.maxReviewRounds);
+    if (tpl.settings?.integrationMode) setIntegrationMode(tpl.settings.integrationMode);
+    if (tpl.source === "自定义") {
+      // 自定义模板：重置逐角色覆盖（其角色信息在快照内，由服务端注入）。
+      setRoleSource("builtin");
+      setGroupId("");
+    }
+  }
+
+  // 当前涉及的角色（规划 + 已选任务阶段角色 + 集成），去重。规划/集成为固定角色。
   const roleIds = useMemo(() => {
     if (!selectedTemplate) return EMPTY_WORKFLOW_ROLE_IDS;
     const ids = [
-      selectedTemplate.planningRoleId,
-      ...selectedTemplate.taskStages.map((s) => s.roleId),
-      selectedTemplate.integrationRoleId,
+      selectedTemplate.planningRoleId || "planner",
+      ...taskKinds.map((k) => STAGE_KIND_TO_ROLE[k] || k),
+      selectedTemplate.integrationRoleId || "integrator",
     ].filter((x): x is string => !!x);
     return Array.from(new Set(ids));
-  }, [selectedTemplate]);
+  }, [selectedTemplate, taskKinds]);
 
   // 选组后按成员 duty/name 与 roleId 做初步自动匹配（可手改）。
   useEffect(() => {
@@ -2578,6 +3088,89 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
     });
   }
 
+  // 由当前阶段/角色列表构造有序 taskStages（kind 唯一，与引擎约定一致）。
+  function buildTaskStages(): Array<{ id: string; kind: string; roleId: string }> {
+    return taskKinds.map((kind) => ({
+      id: kind,
+      kind,
+      roleId: selectedTemplate ? roleIdForKind(selectedTemplate, kind) : STAGE_KIND_TO_ROLE[kind] || kind,
+    }));
+  }
+
+  // ---- 阶段/角色的增删与排序 ----
+  function addStageKind(kind: string) {
+    if (!kind) return;
+    setTaskKinds((prev) => (prev.includes(kind) ? prev : [...prev, kind]));
+  }
+  function removeStageKind(kind: string) {
+    if (kind === "development") return; // development 为必需回退落点，不可删除。
+    setTaskKinds((prev) => prev.filter((k) => k !== kind));
+  }
+  function moveStageKind(index: number, dir: -1 | 1) {
+    setTaskKinds((prev) => {
+      const j = index + dir;
+      if (j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[j]] = [next[j], next[index]];
+      return next;
+    });
+  }
+
+  // 由自定义配置或所选讨论组成员组装角色绑定，覆盖模板角色默认 runtime/model/persona/duty。
+  // submit（启动运行）与“另存为模板”共用，确保保存的模板与即将启动的运行一致。
+  function buildRoleBindings(): Record<string, RoleBinding> | undefined {
+    if (roleSource === "custom" && roleIds.length) {
+      const bindings: Record<string, RoleBinding> = {};
+      for (const roleId of roleIds) {
+        const role = customRoles[roleId] || {
+          runtime: "codex" as AgentRuntime,
+          model: runtimeOptions.codex.defaultModel,
+          persona: "",
+          duty: WORKFLOW_ROLE_LABEL[roleId] || roleId,
+        };
+        bindings[roleId] = {
+          runtime: role.runtime,
+          model: role.model,
+          persona: role.persona.trim(),
+          duty: role.duty.trim(),
+        };
+      }
+      return bindings;
+    }
+    if (roleSource === "group" && selectedGroup && roleIds.length) {
+      const bindings: Record<string, RoleBinding> = {};
+      for (const roleId of roleIds) {
+        const member = selectedGroup.members.find((m) => m.id === roleMap[roleId]);
+        if (member) {
+          bindings[roleId] = {
+            memberId: member.id,
+            runtime: member.runtime,
+            model: member.model,
+            persona: member.persona,
+            duty: member.duty,
+          };
+        }
+      }
+      return bindings;
+    }
+    return undefined;
+  }
+
+  // 打开自定义编辑器：copy=true 以当前选中运行方式为基础另存为新模板；否则编辑已有自定义模板。
+  function openEditor(tpl: WorkflowTemplateSummary | undefined, copy: boolean) {
+    if (!tpl) return;
+    setEditorSeed(seedFromTemplate(tpl, { copy }, runtimeOptions));
+  }
+
+  async function removeTemplate(id: string) {
+    try {
+      await deleteCustomTemplate(id, repoPath.trim());
+      if (templateId === id) setTemplateId("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function submit() {
     setError("");
     if (!goal.trim()) {
@@ -2598,51 +3191,32 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
     }
     setBusy(true);
     try {
-      // 由自定义配置或所选讨论组成员组装角色绑定，覆盖模板角色默认 runtime/model/persona/duty。
-      let roleBindings: Record<string, RoleBinding> | undefined;
-      if (roleSource === "custom" && roleIds.length) {
-        roleBindings = {};
-        for (const roleId of roleIds) {
-          const role = customRoles[roleId] || {
-            runtime: "codex" as AgentRuntime,
-            model: runtimeOptions.codex.defaultModel,
-            persona: "",
-            duty: WORKFLOW_ROLE_LABEL[roleId] || roleId,
-          };
-          roleBindings[roleId] = {
-            runtime: role.runtime,
-            model: role.model,
-            persona: role.persona.trim(),
-            duty: role.duty.trim(),
-          };
-        }
-      } else if (roleSource === "group" && selectedGroup && roleIds.length) {
-        roleBindings = {};
-        for (const roleId of roleIds) {
-          const memberId = roleMap[roleId];
-          const member = selectedGroup.members.find((m) => m.id === memberId);
-          if (member) {
-            roleBindings[roleId] = {
-              memberId: member.id,
-              runtime: member.runtime,
-              model: member.model,
-              persona: member.persona,
-              duty: member.duty,
-            };
-          }
-        }
+      if (isCustomSel) {
+        // 自定义运行方式自包含（阶段/角色/规划已随模板保存，服务端注入其角色绑定）：直接按模板启动，
+        // 不发送 taskStages/roleBindings 覆盖（避免按 kind 折叠掉同类型多角色，如两段开发）。
+        await createRun({
+          projectId,
+          goal: goal.trim(),
+          repositoryPath: repoPath.trim(),
+          baseBranch: baseBranch.trim(),
+          integrationMode: selectedTemplate?.settings.integrationMode || integrationMode,
+          workflowTemplateId: templateId,
+          overrides: {},
+        });
+      } else {
+        const roleBindings = buildRoleBindings();
+        await createRun({
+          projectId,
+          goal: goal.trim(),
+          repositoryPath: repoPath.trim(),
+          baseBranch: baseBranch.trim(),
+          integrationMode,
+          workflowTemplateId: templateId,
+          groupId: roleSource === "group" && selectedGroup ? selectedGroup.id : undefined,
+          settings: roleBindings ? { roleBindings } : undefined,
+          overrides: { maxReviewRounds, integrationMode, taskStages: buildTaskStages() },
+        });
       }
-      await createRun({
-        projectId,
-        goal: goal.trim(),
-        repositoryPath: repoPath.trim(),
-        baseBranch: baseBranch.trim(),
-        integrationMode,
-        workflowTemplateId: templateId,
-        groupId: roleSource === "group" && selectedGroup ? selectedGroup.id : undefined,
-        settings: roleBindings ? { roleBindings } : undefined,
-        overrides: { maxReviewRounds, enableTesting, enableDoc, integrationMode },
-      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -2686,29 +3260,98 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
         </div>
 
         <div className="wf-field">
-          <span>运行方式</span>
+          <span className="wf-field-head">
+            运行方式
+            <button
+              type="button"
+              className="wf-link-action"
+              disabled={!selectedTemplate || !!editorSeed}
+              title={selectedTemplate ? "以当前运行方式为模板，新建一个可自定义角色的运行方式" : "请先选择一个运行方式"}
+              onClick={() => openEditor(selectedTemplate, true)}
+            >
+              <Copy size={13} /> 复制为自定义
+            </button>
+          </span>
           <div className="wf-template-cards">
-            {templates.map((tpl) => (
-              <button
-                key={tpl.id}
-                type="button"
-                className={tpl.id === templateId ? "wf-template-card active" : "wf-template-card"}
-                onClick={() => {
-                  setTemplateId(tpl.id);
-                  setEnableTesting(tpl.taskStages.some((s) => s.kind === "testing"));
-                }}
-              >
-                <div className="wf-template-name">
-                  {tpl.name}
-                  <span className={`wf-source-tag ${tpl.source === "内置" ? "builtin" : "project"}`}>{tpl.source}</span>
-                </div>
-                <div className="wf-template-desc">{tpl.description}</div>
-                <div className="wf-template-meta">
-                  阶段：{tpl.taskStages.map((s) => s.kind).join(" → ")} · 最大重试 {tpl.settings.maxReviewRounds}
-                </div>
-              </button>
-            ))}
+            {templates.map((tpl) => {
+              const sourceClass = tpl.source === "内置" ? "builtin" : tpl.source === "自定义" ? "custom" : "project";
+              return (
+                <button
+                  key={tpl.id}
+                  type="button"
+                  className={tpl.id === templateId ? "wf-template-card active" : "wf-template-card"}
+                  onClick={() => selectTemplate(tpl)}
+                >
+                  <div className="wf-template-name">
+                    {tpl.name}
+                    <span className={`wf-source-tag ${sourceClass}`}>{tpl.source}</span>
+                    {tpl.source === "自定义" && (
+                      <span className="wf-template-card-ops">
+                        <span
+                          className="wf-template-del"
+                          role="button"
+                          tabIndex={0}
+                          title="编辑该自定义运行方式"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openEditor(tpl, false);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              openEditor(tpl, false);
+                            }
+                          }}
+                        >
+                          <Edit3 size={12} />
+                        </span>
+                        <span
+                          className="wf-template-del"
+                          role="button"
+                          tabIndex={0}
+                          title="删除该自定义运行方式"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void removeTemplate(tpl.id);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              void removeTemplate(tpl.id);
+                            }
+                          }}
+                        >
+                          <X size={12} />
+                        </span>
+                      </span>
+                    )}
+                  </div>
+                  <div className="wf-template-desc">{tpl.description}</div>
+                  <div className="wf-template-meta">
+                    阶段：
+                    {(tpl.source === "自定义"
+                      ? tpl.taskStages.map((s) => tpl.roles?.[s.roleId]?.name || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind)
+                      : tpl.taskStages.map((s) => WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind)
+                    ).join(" → ")}{" "}
+                    · 最大重试 {tpl.settings.maxReviewRounds}
+                  </div>
+                </button>
+              );
+            })}
           </div>
+          {editorSeed && (
+            <CustomMethodEditor
+              seed={editorSeed}
+              repoPath={repoPath.trim()}
+              onCancel={() => setEditorSeed(null)}
+              onSaved={(tpl) => {
+                setEditorSeed(null);
+                setTemplateId(tpl.id);
+              }}
+            />
+          )}
         </div>
 
         {templateErrors.length > 0 && (
@@ -2722,23 +3365,52 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        <div className="wf-field">
-          <span>执行角色</span>
-          <select
-            value={roleSource}
-            onChange={(e) => {
-              const next = e.target.value as WorkflowRoleSource;
-              setRoleSource(next);
-              if (next !== "group") setGroupId("");
-            }}
-          >
-            <option value="builtin">使用内置默认角色</option>
-            <option value="custom">自定义每个角色</option>
-            {groups.length > 0 && <option value="group">复用讨论组成员</option>}
-          </select>
-        </div>
+        {isCustomSel && selectedTemplate && (
+          <div className="wf-field">
+            <span className="wf-field-head">
+              该自定义运行方式的角色
+              <button type="button" className="wf-link-action" onClick={() => openEditor(selectedTemplate, false)} disabled={!!editorSeed}>
+                <Edit3 size={13} /> 编辑
+              </button>
+            </span>
+            <div className="wf-custom-summary">
+              {selectedTemplate.taskStages.map((s) => {
+                const b = selectedTemplate.roleBindings?.[s.roleId];
+                const nm = selectedTemplate.roles?.[s.roleId]?.name || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind;
+                return (
+                  <div className="wf-custom-summary-row" key={s.id}>
+                    <span className="wf-role-name">{nm}</span>
+                    <span className="wf-custom-summary-meta">
+                      {WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind}
+                      {b?.runtime ? ` · ${agentRuntimeOptions[b.runtime as AgentRuntime]?.label || b.runtime}` : ""}
+                      {b?.model ? ` · ${b.model}` : ""}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
-        {roleSource === "group" && (
+        {!isCustomSel && (
+          <div className="wf-field">
+            <span>执行角色</span>
+            <select
+              value={roleSource}
+              onChange={(e) => {
+                const next = e.target.value as WorkflowRoleSource;
+                setRoleSource(next);
+                if (next !== "group") setGroupId("");
+              }}
+            >
+              <option value="builtin">使用内置默认角色</option>
+              <option value="custom">自定义每个角色</option>
+              {groups.length > 0 && <option value="group">复用讨论组成员</option>}
+            </select>
+          </div>
+        )}
+
+        {!isCustomSel && roleSource === "group" && (
           <div className="wf-field">
             <span>讨论组</span>
             <select value={groupId} onChange={(e) => setGroupId(e.target.value)}>
@@ -2752,7 +3424,7 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        {roleSource === "group" && selectedGroup && roleIds.length > 0 && (
+        {!isCustomSel && roleSource === "group" && selectedGroup && roleIds.length > 0 && (
           <div className="wf-field">
             <span>角色 → 成员映射</span>
             <div className="wf-role-map">
@@ -2776,7 +3448,7 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        {roleSource === "custom" && roleIds.length > 0 && (
+        {!isCustomSel && roleSource === "custom" && roleIds.length > 0 && (
           <div className="wf-field">
             <span>自定义角色</span>
             <div className="wf-custom-roles">
@@ -2839,36 +3511,94 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        <button type="button" className="wf-advanced-toggle" onClick={() => setAdvancedOpen((v) => !v)}>
-          {advancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} 高级设置
-        </button>
-        {advancedOpen && (
-          <div className="wf-advanced">
-            <label className="wf-field">
-              <span>最大 Review/修改轮次</span>
-              <input
-                type="number"
-                min={1}
-                value={maxReviewRounds}
-                onChange={(e) => setMaxReviewRounds(Math.max(1, Number(e.target.value) || 1))}
-              />
-            </label>
-            <label className="wf-check">
-              <input type="checkbox" checked={enableTesting} onChange={(e) => setEnableTesting(e.target.checked)} />
-              启用独立测试角色
-            </label>
-            <label className="wf-check">
-              <input type="checkbox" checked={enableDoc} onChange={(e) => setEnableDoc(e.target.checked)} />
-              启用文档角色
-            </label>
+        {selectedTemplate && !isCustomSel && (
+          <div className="wf-field">
+            <span className="wf-field-head">
+              阶段 / 角色
+              {(() => {
+                const addable = ALL_STAGE_KINDS.filter((k) => !taskKinds.includes(k));
+                return addable.length > 0 ? (
+                  <select
+                    className="wf-stage-add"
+                    value=""
+                    onChange={(e) => {
+                      addStageKind(e.target.value);
+                      e.target.value = "";
+                    }}
+                  >
+                    <option value="">+ 添加角色…</option>
+                    {addable.map((k) => (
+                      <option key={k} value={k}>
+                        {WORKFLOW_STAGE_KIND_LABEL[k] || k}
+                      </option>
+                    ))}
+                  </select>
+                ) : null;
+              })()}
+            </span>
+            <div className="wf-stage-list">
+              <div className="wf-stage-fixed">规划</div>
+              {taskKinds.map((kind, i) => (
+                <div className="wf-stage-item" key={kind}>
+                  <span className="wf-stage-name">{WORKFLOW_STAGE_KIND_LABEL[kind] || kind}</span>
+                  <span className="wf-stage-ops">
+                    <button type="button" title="上移" disabled={i === 0} onClick={() => moveStageKind(i, -1)}>
+                      <ChevronUp size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      title="下移"
+                      disabled={i === taskKinds.length - 1}
+                      onClick={() => moveStageKind(i, 1)}
+                    >
+                      <ChevronDown size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      title={kind === "development" ? "开发为必需角色，不可删除" : "删除该角色"}
+                      disabled={kind === "development"}
+                      onClick={() => removeStageKind(kind)}
+                    >
+                      <X size={13} />
+                    </button>
+                  </span>
+                </div>
+              ))}
+              <div className="wf-stage-fixed">集成</div>
+            </div>
           </div>
+        )}
+
+        {!isCustomSel && (
+          <>
+            <button type="button" className="wf-advanced-toggle" onClick={() => setAdvancedOpen((v) => !v)}>
+              {advancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} 高级设置
+            </button>
+            {advancedOpen && (
+              <div className="wf-advanced">
+                <label className="wf-field">
+                  <span>最大 Review/修改轮次</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={maxReviewRounds}
+                    onChange={(e) => setMaxReviewRounds(Math.max(1, Number(e.target.value) || 1))}
+                  />
+                </label>
+              </div>
+            )}
+          </>
         )}
 
         {selectedTemplate && (
           <div className="wf-summary">
             最终流程：规划 →{" "}
-            {(enableDoc ? [...filterStages(selectedTemplate, enableTesting), "doc"] : filterStages(selectedTemplate, enableTesting)).join(" → ")}{" "}
-            → 提交 → 集成（{integrationMode === "pull_request" ? "PR" : "直接合并"}）
+            {(isCustomSel
+              ? selectedTemplate.taskStages.map((s) => selectedTemplate.roles?.[s.roleId]?.name || WORKFLOW_STAGE_KIND_LABEL[s.kind] || s.kind)
+              : taskKinds.map((k) => WORKFLOW_STAGE_KIND_LABEL[k] || k)
+            ).join(" → ")}{" "}
+            → 提交 → 集成（
+            {(isCustomSel ? selectedTemplate.settings.integrationMode : integrationMode) === "pull_request" ? "PR" : "直接合并"}）
           </div>
         )}
 
@@ -2887,8 +3617,12 @@ function CreateRunWizard({ projectId }: { projectId: string }) {
   );
 }
 
-function filterStages(tpl: WorkflowTemplateSummary, enableTesting: boolean): string[] {
-  return tpl.taskStages.map((s) => s.kind).filter((k) => (enableTesting ? true : k !== "testing"));
+// 取某阶段 kind 对应的执行角色 id；模板未显式声明时退回与 kind 同名的内置角色。
+function roleIdForKind(tpl: WorkflowTemplateSummary, kind: string): string {
+  const hit = tpl.taskStages.find((s) => s.kind === kind);
+  if (hit) return hit.roleId;
+  const fallback: Record<string, string> = { development: "developer", review: "reviewer", testing: "tester", doc: "doc" };
+  return fallback[kind] || kind;
 }
 
 function WorkflowWorkspace() {
@@ -3278,6 +4012,7 @@ function ChatPanel({
   onDeleteCommand,
   onAddCommand,
   onClear,
+  onGoDev,
 }: {
   selectedProject?: Project;
   selectedAgent?: Agent;
@@ -3291,6 +4026,7 @@ function ChatPanel({
   onDeleteCommand: (command: Command) => void;
   onAddCommand: () => void;
   onClear: () => void;
+  onGoDev: (message: Message) => void;
 }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const lastMessageId = messages.at(-1)?.id ?? "";
@@ -3332,7 +4068,9 @@ function ChatPanel({
         ) : messages.length === 0 ? (
           <EmptyState title="开始新的会话" description={`${selectedProject?.name ?? ""} / ${selectedAgent.name}`} />
         ) : (
-          messages.map((message) => <MessageBubble key={message.id} message={message} agent={selectedAgent} />)
+          messages.map((message) => (
+            <MessageBubble key={message.id} message={message} agent={selectedAgent} onGoDev={onGoDev} />
+          ))
         )}
         {processing && selectedAgent && (
           <div className="message-row agent-message">
@@ -3738,7 +4476,7 @@ function TerminalPanel({
   );
 }
 
-function MessageBubble({ message, agent }: { message: Message; agent: Agent }) {
+function MessageBubble({ message, agent, onGoDev }: { message: Message; agent: Agent; onGoDev?: (message: Message) => void }) {
   const user = message.role === "user";
   return (
     <div className={user ? "message-row user-message" : "message-row agent-message"}>
@@ -3751,6 +4489,15 @@ function MessageBubble({ message, agent }: { message: Message; agent: Agent }) {
         {!user && <strong>{agent.name}</strong>}
         {message.messageType === "command" && <span className="command-label">COMMAND</span>}
         <MessageContent content={message.content} />
+        {message.devReady && onGoDev && (
+          <div className="chat-go-dev">
+            <span className="chat-go-dev-hint">需求已明确，可进入自动开发</span>
+            <button className="primary-button compact" type="button" onClick={() => onGoDev(message)}>
+              <Play size={15} />
+              去开发
+            </button>
+          </div>
+        )}
       </div>
       <time>{formatTime(message.createdAt)}</time>
     </div>
@@ -3837,6 +4584,7 @@ function ModalHost({ modal, close }: { modal: ModalState; close: () => void }) {
           workdir: modal.agent.workdir,
           startCommand: modal.agent.startCommand,
           status: modal.agent.status,
+          kind: modal.agent.kind || "normal",
         }
       : defaultAgentFormForProject,
   );
@@ -3868,6 +4616,7 @@ function ModalHost({ modal, close }: { modal: ModalState; close: () => void }) {
         workdir: modal.agent.workdir || formProject?.rootPath || defaultRootPath,
         startCommand: normalizeStartCommand(modal.agent.startCommand, runtime, model),
         status: modal.agent.status,
+        kind: modal.agent.kind || "normal",
       });
     } else if (modal?.type === "agent") {
       setAgentForm({
@@ -4071,6 +4820,14 @@ function ModalHost({ modal, close }: { modal: ModalState; close: () => void }) {
             <Field label="描述">
               <textarea value={agentForm.description} onChange={(event) => setAgentForm({ ...agentForm, description: event.target.value })} />
             </Field>
+            <label className="checkbox-line">
+              <input
+                checked={agentForm.kind === "clarifier"}
+                type="checkbox"
+                onChange={(event) => setAgentForm({ ...agentForm, kind: event.target.checked ? "clarifier" : "normal" })}
+              />
+              用作需求澄清助手（对话澄清需求，明确后可一键去开发）
+            </label>
             <div className="modal-actions">
               {modal.mode === "edit" && modal.agent && (
                 <button

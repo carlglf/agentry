@@ -11,6 +11,7 @@ import { createMemberPtyManager, isDiscussionKey } from "./server/discussion-pty
 import { handleDiscussionApi } from "./server/discussion-routes.mjs";
 import { createModelDiscovery } from "./server/model-discovery.mjs";
 import { createWorkflowStore } from "./server/workflow-store.mjs";
+import { createTemplateStore } from "./server/workflow-template-store.mjs";
 import { createRoleSessionPtyManager, isWorkflowKey } from "./server/workflow-pty.mjs";
 import { createGitRunner } from "./server/workflow-git.mjs";
 import { handleWorkflowApi, recoverRuns } from "./server/workflow-routes.mjs";
@@ -66,6 +67,11 @@ const wfStore = createWorkflowStore({
   dataDir: process.env.AGENT_CONSOLE_DATA_DIR || path.join(__dirname, ".data"),
 });
 await wfStore.load();
+// 自定义运行方式模板：用户以内置流程为模板复制再改后另存复用（落盘 .data/workflow-templates.json）。
+const tplStore = createTemplateStore({
+  dataDir: process.env.AGENT_CONSOLE_DATA_DIR || path.join(__dirname, ".data"),
+});
+await tplStore.load();
 const roleSessionPtyMgr = createRoleSessionPtyManager({ spawn: pty.spawn, runtimeMeta });
 // 生产用 execFile 包装为统一的 (file, args, {cwd}) => {code, stdout, stderr}。
 const gitRunner = createGitRunner({
@@ -210,6 +216,7 @@ async function handleApi(req, res) {
     await handleWorkflowApi(req, res, {
       wfStore,
       discStore,
+      tplStore,
       ptyMgr: roleSessionPtyMgr,
       gitRunner,
       runtimeMeta,

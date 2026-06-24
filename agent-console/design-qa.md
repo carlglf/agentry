@@ -40,6 +40,11 @@
 - Interaction note: host selection is now a visible crown action on each member card; deleting the current host automatically promotes the first remaining member so the form does not enter a hidden invalid state. Member persona and duty are multiline textareas because they are descriptive fields.
 - Verification: `npm run build` and `npx tsc --noEmit` passed after the change. CDP screenshot evidence: `qa/discussion-group-modal-textarea.png`.
 
+**2026-06-23 Workflow Custom Editor Polish**
+- Source feedback: the custom workflow editor stage rows were visually misaligned and textarea controls were squeezed.
+- Decision: keep the workflow editor as a compact technical form, but scope a dedicated stage-card layout under `.wf-editor` so stage rows use a stable two-line grid: type/name/runtime/model on the first row, duty/persona on the second row, with the stage index and move/delete controls in a fixed left rail.
+- Verification: `npm run build` and `npx tsc --noEmit` passed after the change. CDP screenshot evidence: `qa/workflow-custom-editor-polish.png`.
+
 **Implementation Checklist**
 - Build passes.
 - Local app runs at `http://127.0.0.1:5173/`.

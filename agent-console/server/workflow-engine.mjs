@@ -95,6 +95,26 @@ function firstDevelopmentStatus(stages) {
   return dev ? statusFromStageKind(dev.kind) : "developing";
 }
 
+/** 首个 development 阶段对象（门槛失败的回退落点）。无则回退到第一个阶段。 */
+export function firstDevelopmentStage(stages) {
+  return stages.find((s) => s && s.kind === "development") || stages[0] || null;
+}
+
+/**
+ * 定位任务当前所处阶段的下标。优先用 task.stageId（支持同 kind 多阶段，如客户端开发/服务端开发），
+ * 回退到由任务状态推 kind（旧行为，内置流程 kind 唯一时完全等价）。未进入任何阶段返回 -1。
+ */
+export function currentStageIndex(snapshot, task) {
+  const stages = taskStagesOf(snapshot);
+  const stageId = task && task.stageId;
+  if (stageId) {
+    const i = stages.findIndex((s) => s && s.id === stageId);
+    if (i !== -1) return i;
+  }
+  const curKind = stageKindFromStatus(task && (task.stage || task.status));
+  return stages.findIndex((s) => s && s.kind === curKind);
+}
+
 // ---- 计划与调度（PRD §5.6 / §7.2 / §7.3）----
 
 /**
@@ -203,22 +223,32 @@ export function dependentsOf(tasks, taskId) {
  * @returns {string} 下一任务状态名
  */
 export function nextStage(snapshot, task, result) {
+  const d = nextStageDescriptor(snapshot, task, result);
+  if (d.done) return "approved";
+  return statusFromStageKind(d.stage.kind);
+}
+
+/**
+ * 按阶段 id 推进的「下一步」描述（支持同 kind 多阶段）：
+ * - `{ done: true }`：走完全部阶段 → approved → 提交；
+ * - `{ fix: true, stage }`：门槛（review/testing）未过 → 回退到首个 development 阶段（fixing）；
+ * - `{ stage }`：进入下一个阶段（含同为开发的串联阶段，如客户端→服务端）。
+ * stage 为快照中的阶段对象 { id, kind, roleId }，调用方据此解析每阶段独立角色。
+ */
+export function nextStageDescriptor(snapshot, task, result) {
   const stages = taskStagesOf(snapshot);
-  if (stages.length === 0) return "approved";
-  const curKind = stageKindFromStatus(task.stage || task.status);
-  const idx = stages.findIndex((s) => s.kind === curKind);
+  if (stages.length === 0) return { done: true };
+  const idx = currentStageIndex(snapshot, task);
   if (idx === -1) {
     // 尚未进入任何阶段：从第一个阶段开始。
-    return statusFromStageKind(stages[0].kind);
+    return { stage: stages[0] };
   }
   const stage = stages[idx];
-  if (isGateKind(stage.kind)) {
-    if (!isStagePass(stage.kind, result)) {
-      return firstDevelopmentStatus(stages);
-    }
+  if (isGateKind(stage.kind) && !isStagePass(stage.kind, result)) {
+    return { fix: true, stage: firstDevelopmentStage(stages) };
   }
   const next = stages[idx + 1];
-  return next ? statusFromStageKind(next.kind) : "approved";
+  return next ? { stage: next } : { done: true };
 }
 
 /** 门槛阶段结果是否通过。 */
@@ -288,7 +318,10 @@ export function validateStageSubmission({
   }
 
   // 提交的阶段种类必须与任务当前阶段一致——防止跳过 Review、Review 未过进测试/提交等（PRD §8.3）。
-  const expectedKind = stageKindFromStatus(task.stage || task.status);
+  // 当前阶段优先由 task.stageId 定位（支持同 kind 多阶段），回退到由状态推 kind。
+  const curIdx = currentStageIndex(snapshot, task);
+  const curStage = curIdx >= 0 ? taskStagesOf(snapshot)[curIdx] : null;
+  const expectedKind = curStage ? curStage.kind : stageKindFromStatus(task.stage || task.status);
   if (expectedKind && kind !== expectedKind) {
     return {
       ok: false,
@@ -299,7 +332,8 @@ export function validateStageSubmission({
 
   // 提交者角色必须是该阶段在流程模板中的执行角色——防止开发会话在进入 Review/测试后仍存活时，
   // 主动调用 acg stage submit --type review/test 自评通过，绕过独立 Review/测试门槛（PRD §8.3）。
-  const stageDef = (snapshot?.workflow?.taskStages || []).find((s) => s.kind === kind);
+  // 同 kind 多阶段时，以当前阶段（curStage）的角色为准，而非按 kind 取首个。
+  const stageDef = curStage && curStage.kind === kind ? curStage : (snapshot?.workflow?.taskStages || []).find((s) => s.kind === kind);
   if (stageDef && stageDef.roleId && roleId && roleId !== stageDef.roleId) {
     return {
       ok: false,
